@@ -21,8 +21,8 @@ import numpy as np
 # Features:
 #   - Per-frame mono/stereo coding decisions
 #   - Per-frame SWB/fullband bandwidth decisions
-#   - Mono bitrate multiplier: 0.50 by default
-#   - SWB bitrate multiplier: 0.70 by default
+#   - Mono bitrate multiplier: 0.80 by default
+#   - SWB bitrate multiplier: 0.80 by default
 #   - Adaptive VBR first pass
 #   - Activity/transient-aware bitrate allocation
 #   - Two-pass bitrate-pattern adjustment
@@ -1210,15 +1210,15 @@ def main():
     parser.add_argument(
         "--mono-multiplier",
         type=float,
-        default=0.50,
-        help="Per-frame bitrate multiplier for mono coding (default: 0.50)",
+        default=0.80,
+        help="Per-frame bitrate multiplier for mono coding (default: 0.80)",
     )
 
     parser.add_argument(
         "--swb-multiplier",
         type=float,
-        default=0.70,
-        help="Per-frame bitrate multiplier for SWB (default: 0.70)",
+        default=0.80,
+        help="Per-frame bitrate multiplier for SWB (default: 0.80)",
     )
 
     parser.add_argument(
@@ -1231,7 +1231,7 @@ def main():
     parser.add_argument(
         "--mono-exit-db",
         type=float,
-        default=-38.0,
+        default=-41.0,
         help="Return to stereo when side signal exceeds this dB level",
     )
 
@@ -1245,7 +1245,7 @@ def main():
     parser.add_argument(
         "--swb-exit-db",
         type=float,
-        default=-40.0,
+        default=-41.0,
         help="Return to fullband when high-band energy exceeds this dB level",
     )
 
