@@ -19,9 +19,11 @@ ffmpeg in PATH (https://drive.google.com/file/d/1_ObJ_u9OBw5aSSEik3JsJu3LJ1uoyzY
 
 Opus+ uses VBR, same for normal Opus, but it's spiced up a lot at higher settings.
 
-Opus+ encodes in 2 passes in pass-mode offset (default): Pass 1, which is just normal encoding, and pass 2, which offsets all the bitrates per frame to get the average bitrate as close to the target as possible.
+Opus+ encodes in 2 passes in pass-mode two-pass (default): Pass 1, which is just normal encoding, and pass 2, which multiplies all the bitrates per frame to get the average bitrate as close to the target as possible.
 
 In pass mode live, Opus+ will adjust the bitrate dynamically as it encodes depending on if the average bitrate is over or under the target
+
+Opus+ will also detect content with no noticeable stereo (basically mono) and with no noticeable audio over 10-12kHz and will adjust the bitrate for slightly more savings.
 
 --------------- How I got the idea (for those curious) --------------
 
