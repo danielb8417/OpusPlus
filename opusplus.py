@@ -11,28 +11,6 @@ import time
 
 import numpy as np
 
-
-# ============================================================
-# OpusPlus
-#
-# Requirements:
-#   Python, numpy, FFmpeg, opus.dll
-#
-# Features:
-#   - Per-frame mono/stereo coding decisions
-#   - Per-frame SWB/fullband bandwidth decisions
-#   - Mono bitrate multiplier: 0.80 by default
-#   - SWB bitrate multiplier: 0.80 by default
-#   - Adaptive VBR first pass
-#   - Activity/transient-aware bitrate allocation
-#   - Two-pass bitrate-pattern adjustment
-#   - Pass 2 repeats Pass 1's per-frame mode decisions
-#   - Ogg Opus output
-#
-# The Ogg Opus stream remains configured for stereo output.
-# Mono-coded frames are decoded to dual-mono stereo by the decoder.
-# ============================================================
-
 RATE = 48000
 CHANNELS = 2
 OPUS_APPLICATION_AUDIO = 2049
@@ -48,7 +26,6 @@ OPUS_GET_LOOKAHEAD_REQUEST = 4027
 OPUS_AUTO = -1000
 OPUS_SIGNAL_VOICE = 3001
 OPUS_SIGNAL_MUSIC = 3002
-
 OPUS_BANDWIDTH_SUPERWIDEBAND = 1104
 OPUS_BANDWIDTH_FULLBAND = 1105
 
@@ -58,25 +35,23 @@ OGG_OVERHEAD_ESTIMATE_BPS = 250
 MAX_PACKET_BYTES = 1275 * 3
 
 
+def output_channels(args):
+    return 1 if args.pure_mono else CHANNELS
+
+
 # ============================================================
 # libopus
 # ============================================================
 
 def load_opus(dll_path=None):
     candidates = (
-        [dll_path]
-        if dll_path
-        else [
-            os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "opus.dll",
-            ),
+        [dll_path] if dll_path else [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "opus.dll"),
             "opus.dll",
         ]
     )
 
     last_error = None
-
     for candidate in candidates:
         try:
             return ctypes.CDLL(candidate)
@@ -92,9 +67,7 @@ def load_opus(dll_path=None):
 
 def configure_opus_functions(opus):
     opus.opus_encoder_create.argtypes = [
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.POINTER(ctypes.c_int),
     ]
     opus.opus_encoder_create.restype = ctypes.c_void_p
@@ -111,11 +84,7 @@ def configure_opus_functions(opus):
     ]
     opus.opus_encode.restype = ctypes.c_int
 
-    # libopus_encoder_ctl is variadic.
-    opus.opus_encoder_ctl.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_int,
-    ]
+    opus.opus_encoder_ctl.argtypes = [ctypes.c_void_p, ctypes.c_int]
     opus.opus_encoder_ctl.restype = ctypes.c_int
 
     if hasattr(opus, "opus_get_version_string"):
@@ -126,85 +95,46 @@ def configure_opus_functions(opus):
 
 def opus_ctl(opus, encoder, request, value):
     result = opus.opus_encoder_ctl(
-        encoder,
-        ctypes.c_int(request),
-        ctypes.c_int(int(value)),
+        encoder, ctypes.c_int(request), ctypes.c_int(int(value))
     )
-
     if result != 0:
-        raise RuntimeError(
-            f"libopus control {request} failed: {result}"
-        )
+        raise RuntimeError(f"libopus control {request} failed: {result}")
 
 
 def create_encoder(opus, args, cbr=False):
+    channels = output_channels(args)
     error = ctypes.c_int(0)
 
-    # Always create a two-channel encoder. We can request mono coding
-    # for individual frames while retaining a stereo-configured stream.
     encoder = opus.opus_encoder_create(
-        RATE,
-        CHANNELS,
-        OPUS_APPLICATION_AUDIO,
-        ctypes.byref(error),
+        RATE, channels, OPUS_APPLICATION_AUDIO, ctypes.byref(error)
     )
 
     if not encoder or error.value != 0:
-        raise RuntimeError(
-            f"Could not create encoder: {error.value}"
-        )
+        raise RuntimeError(f"Could not create encoder: {error.value}")
 
     try:
-        opus_ctl(
-            opus,
-            encoder,
-            OPUS_SET_VBR_REQUEST,
-            0 if cbr else 1,
-        )
-
-        opus_ctl(
-            opus,
-            encoder,
-            OPUS_SET_COMPLEXITY_REQUEST,
-            args.complexity,
-        )
+        opus_ctl(opus, encoder, OPUS_SET_VBR_REQUEST, 0 if cbr else 1)
+        opus_ctl(opus, encoder, OPUS_SET_COMPLEXITY_REQUEST, args.complexity)
 
         signal = {
             "auto": OPUS_AUTO,
             "music": OPUS_SIGNAL_MUSIC,
             "voice": OPUS_SIGNAL_VOICE,
         }[args.mode]
-
+        opus_ctl(opus, encoder, OPUS_SET_SIGNAL_REQUEST, signal)
         opus_ctl(
-            opus,
-            encoder,
-            OPUS_SET_SIGNAL_REQUEST,
-            signal,
-        )
-
-        # Initial values; updated for each frame before encoding.
-        opus_ctl(
-            opus,
-            encoder,
-            OPUS_SET_MAX_BANDWIDTH_REQUEST,
+            opus, encoder, OPUS_SET_MAX_BANDWIDTH_REQUEST,
             OPUS_BANDWIDTH_FULLBAND,
         )
 
-        opus_ctl(
-            opus,
-            encoder,
-            OPUS_SET_FORCE_CHANNELS_REQUEST,
-            2,
-        )
+        if channels == 2:
+            opus_ctl(opus, encoder, OPUS_SET_FORCE_CHANNELS_REQUEST, 2)
 
         lookahead = ctypes.c_int(0)
-
         result = opus.opus_encoder_ctl(
-            encoder,
-            ctypes.c_int(OPUS_GET_LOOKAHEAD_REQUEST),
+            encoder, ctypes.c_int(OPUS_GET_LOOKAHEAD_REQUEST),
             ctypes.byref(lookahead),
         )
-
         pre_skip = lookahead.value if result == 0 else 312
 
         return encoder, pre_skip
@@ -215,50 +145,37 @@ def create_encoder(opus, args, cbr=False):
 
 
 # ============================================================
-# FFmpeg input decoding
+# Decode and frame preparation
 # ============================================================
 
 def find_ffmpeg():
     path = shutil.which("ffmpeg")
-
     if not path:
-        raise RuntimeError(
-            "FFmpeg was not found on PATH."
-        )
-
+        raise RuntimeError("FFmpeg was not found on PATH.")
     return path
 
 
-def decode_input(path):
+def decode_input(path, pure_mono=False):
+    channels = 1 if pure_mono else 2
+
     command = [
-        find_ffmpeg(),
-        "-hide_banner",
-        "-loglevel", "error",
-        "-i", path,
-        "-map", "0:a:0",
+        find_ffmpeg(), "-hide_banner", "-loglevel", "error",
+        "-i", path, "-map", "0:a:0",
         "-vn", "-sn", "-dn",
-        "-f", "s16le",
-        "-acodec", "pcm_s16le",
-        "-ar", str(RATE),
-        "-ac", "2",
-        "pipe:1",
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-ar", str(RATE), "-ac", str(channels), "pipe:1",
     ]
 
     process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
-
     pcm = bytearray()
 
     try:
         while True:
             chunk = process.stdout.read(1024 * 1024)
-
             if not chunk:
                 break
-
             pcm.extend(chunk)
 
         stderr = process.stderr.read()
@@ -274,20 +191,17 @@ def decode_input(path):
             process.kill()
             process.wait()
 
-    pcm = pcm[:len(pcm) - len(pcm) % 4]
+    sample_width = 2 * channels
+    pcm = pcm[:len(pcm) - len(pcm) % sample_width]
 
     if not pcm:
-        raise RuntimeError("FFmpeg decoded no audio samples")
+        raise RuntimeError("FFmpeg decoded no audio samples.")
 
     return np.frombuffer(bytes(pcm), dtype=np.int16).copy()
 
 
-# ============================================================
-# Frame preparation
-# ============================================================
-
-def make_frames(pcm, frame_samples):
-    values_per_frame = frame_samples * CHANNELS
+def make_frames(pcm, frame_samples, channels):
+    values_per_frame = frame_samples * channels
     frames = []
 
     for start in range(0, len(pcm), values_per_frame):
@@ -299,64 +213,101 @@ def make_frames(pcm, frame_samples):
             padded[:actual_values] = chunk
             chunk = padded
 
-        frames.append(
-            (chunk, actual_values // CHANNELS)
-        )
+        frames.append((chunk, actual_values // channels))
 
     return frames
 
 
 # ============================================================
-# Per-frame spectral and stereo analysis
+# Per-frame peak normalization for analysis only
+# ============================================================
+
+def normalize_analysis_frames(frames, args, channels):
+    """Normalize each frame independently for VBR analysis.
+
+    Level 0: no normalization.
+    Level 10: full peak normalization to 0 dBFS.
+    Intermediate levels apply that fraction of the required gain,
+    measured in decibels.
+
+    The original PCM used for Opus encoding is never modified.
+    """
+    level = args.vbr_normalize_level
+
+    if not args.vbr_normalize or level == 0:
+        return [frame.copy() for frame, _ in frames]
+
+    intensity = level / 10.0
+    normalized = []
+
+    for frame, actual_samples in frames:
+        x = frame.astype(np.float32).copy()
+        valid_values = actual_samples * channels
+        valid = x[:valid_values]
+
+        if valid.size == 0:
+            normalized.append(frame.copy())
+            continue
+
+        peak = float(np.max(np.abs(valid)))
+
+        # Keep digital silence silent. No arbitrary maximum-gain cap.
+        if peak <= args.vbr_normalize_gate:
+            normalized.append(frame.copy())
+            continue
+
+        # Peak normalization gain needed to reach 0 dBFS.
+        target_gain_db = 20.0 * math.log10(32768.0 / peak)
+        target_gain_db = max(0.0, target_gain_db)
+
+        # Intensity scales the gain in dB, not the linear amplitude.
+        applied_gain_db = target_gain_db * intensity
+        gain = 10.0 ** (applied_gain_db / 20.0)
+
+        x *= gain
+        x = np.clip(x, -32768.0, 32767.0).astype(np.int16)
+        normalized.append(x)
+
+    return normalized
+
+
+# ============================================================
+# Mono / superwideband detection
 # ============================================================
 
 def analyze_mode(frame, previous_mode, args):
-    """
-    Return (mono, swb).
+    channels = output_channels(args)
+    samples = np.asarray(frame, dtype=np.float32)
 
-    Mono:
-        Compare L-R side energy with L+R mid energy.
-
-    Bandwidth:
-        Measure energy at/above 12 kHz relative to lower frequencies.
-
-    Hysteresis:
-        Use separate thresholds when switching into and out of a mode.
-    """
-
-    stereo = np.asarray(frame, dtype=np.float32).reshape(-1, 2)
-
-    left = stereo[:, 0]
-    right = stereo[:, 1]
-
-    mid = (left + right) * 0.5
-    side = (left - right) * 0.5
-
-    mid_rms = float(np.sqrt(np.mean(mid * mid) + 1e-12))
-    side_rms = float(np.sqrt(np.mean(side * side) + 1e-12))
-
-    side_db = 20.0 * math.log10(
-        max(side_rms, 1e-9) / max(mid_rms, 1e-9)
-    )
-
-    # A frame must have very little side information to use mono.
-    # Thresholds are configurable for experimentation.
-    if previous_mode is not None and previous_mode["mono"]:
-        mono = side_db < args.mono_exit_db
+    if channels == 1:
+        mid = samples
+        mid_rms = float(np.sqrt(np.mean(mid * mid) + 1e-12))
+        side_db = -120.0
+        mono = True
     else:
-        mono = side_db < args.mono_enter_db
+        stereo = samples.reshape(-1, 2)
+        left = stereo[:, 0]
+        right = stereo[:, 1]
 
-    # Use the mono-like mid signal for bandwidth detection so that
-    # a wide stereo effect alone does not trigger fullband.
+        mid = (left + right) * 0.5
+        side = (left - right) * 0.5
+
+        mid_rms = float(np.sqrt(np.mean(mid * mid) + 1e-12))
+        side_rms = float(np.sqrt(np.mean(side * side) + 1e-12))
+
+        side_db = 20.0 * math.log10(
+            max(side_rms, 1e-9) / max(mid_rms, 1e-9)
+        )
+
+        if previous_mode is not None and previous_mode["mono"]:
+            mono = side_db < args.mono_exit_db
+        else:
+            mono = side_db < args.mono_enter_db
+
     window = np.hanning(len(mid)).astype(np.float32)
-
     spectrum = np.fft.rfft(mid * window)
     power = np.abs(spectrum) ** 2
-
-    frequencies = np.fft.rfftfreq(
-        len(mid),
-        d=1.0 / RATE,
-    )
+    frequencies = np.fft.rfftfreq(len(mid), d=1.0 / RATE)
 
     low = float(np.sum(power[frequencies < 12000.0]))
     high = float(np.sum(power[frequencies >= 12000.0]))
@@ -370,10 +321,12 @@ def analyze_mode(frame, previous_mode, args):
     else:
         swb = high_db < args.swb_enter_db
 
-    # Silence has no useful evidence of stereo or high frequencies.
     if mid_rms < args.silence_threshold:
         mono = True
         swb = True
+
+    if args.pure_mono:
+        mono = True
 
     return {
         "mono": bool(mono),
@@ -387,7 +340,7 @@ def analyze_all_modes(frames, args):
     modes = []
     previous = None
 
-    for frame, actual_samples in frames:
+    for frame, _ in frames:
         mode = analyze_mode(frame, previous, args)
         modes.append(mode)
         previous = mode
@@ -398,7 +351,7 @@ def analyze_all_modes(frames, args):
 def mode_multiplier(mode, args):
     multiplier = 1.0
 
-    if mode["mono"]:
+    if mode["mono"] and not args.pure_mono:
         multiplier *= args.mono_multiplier
 
     if mode["swb"]:
@@ -408,20 +361,18 @@ def mode_multiplier(mode, args):
 
 
 # ============================================================
-# Activity and transient analysis
+# Activity / transient analysis
 # ============================================================
 
-def analyze_frame(frame):
-    x = np.asarray(frame, dtype=np.float32).reshape(-1, 2)
+def analyze_frame(frame, channels):
+    x = np.asarray(frame, dtype=np.float32).reshape(-1, channels)
 
     if len(x) < 3:
         return 0.45, 0.0
 
     rms = float(np.sqrt(np.mean(x * x) + 1.0))
-
     delta = np.diff(x, axis=0)
     mean_delta = float(np.mean(np.abs(delta)) + 1.0)
-
     relative_delta = mean_delta / max(rms, 16.0)
 
     level_activity = math.log10(1.0 + rms / 500.0)
@@ -434,28 +385,17 @@ def analyze_frame(frame):
 
     second_delta = np.diff(x, n=2, axis=0)
     curvature = float(np.mean(np.abs(second_delta)) + 1.0)
-
     transient_ratio = curvature / max(mean_delta, 1.0)
 
     half = max(1, len(x) // 2)
-
     rms_a = float(np.sqrt(np.mean(x[:half] ** 2) + 1.0))
     rms_b = float(np.sqrt(np.mean(x[half:] ** 2) + 1.0))
-
-    level_jump = abs(
-        math.log((rms_b + 16.0) / (rms_a + 16.0))
-    )
+    level_jump = abs(math.log((rms_b + 16.0) / (rms_a + 16.0)))
 
     curvature_score = max(
-        0.0,
-        min((transient_ratio - 1.0) / 5.0, 1.0),
+        0.0, min((transient_ratio - 1.0) / 5.0, 1.0)
     )
-
-    jump_score = max(
-        0.0,
-        min(level_jump / 1.5, 1.0),
-    )
-
+    jump_score = max(0.0, min(level_jump / 1.5, 1.0))
     transient = 0.65 * curvature_score + 0.35 * jump_score
 
     return activity, max(0.0, min(transient, 1.0))
@@ -466,56 +406,40 @@ def analyze_frame(frame):
 # ============================================================
 
 class BitrateController:
-    def __init__(self, target_kbps, intensity):
+    def __init__(self, target_kbps, intensity, channels):
         self.target_bps = float(target_kbps) * 1000.0
         self.intensity = int(intensity)
-
+        self.channels = channels
         self.total_packet_bytes = 0
         self.total_samples = 0
 
-    def bitrate_for_frame(self, frame, multiplier):
+    def bitrate_for_frame(self, analysis_frame, multiplier):
         packet_target_bps = max(
             MIN_BITRATE_BPS,
-            self.target_bps * multiplier - 250.0,
+            self.target_bps * multiplier - OGG_OVERHEAD_ESTIMATE_BPS,
         )
 
         if self.intensity == 0:
             return int(packet_target_bps)
 
-        activity, transient = analyze_frame(frame)
+        activity, transient = analyze_frame(
+            analysis_frame, self.channels
+        )
         strength = self.intensity / 10.0
 
-        activity_factor = 1.0 + strength * (
-            (activity - 0.45) * 0.90
-        )
-
+        activity_factor = 1.0 + strength * ((activity - 0.45) * 0.90)
         transient_factor = 1.0 + strength * 0.40 * transient
 
-        activity_factor = max(
-            0.75,
-            min(1.50, activity_factor),
-        )
-
-        transient_factor = max(
-            1.0,
-            min(1.40, transient_factor),
-        )
+        activity_factor = max(0.75, min(1.50, activity_factor))
+        transient_factor = max(1.0, min(1.40, transient_factor))
 
         if self.total_samples <= 0 or self.total_packet_bytes <= 0:
             feedback_factor = 1.0
         else:
             elapsed = self.total_samples / RATE
-
-            # Feedback tracks the nominal overall target. Per-frame
-            # mode reductions are applied separately above.
             target_bytes = self.target_bps * elapsed / 8.0
-
             ratio = target_bytes / max(self.total_packet_bytes, 1)
-
-            feedback_factor = max(
-                0.70,
-                min(1.40, ratio ** 0.35),
-            )
+            feedback_factor = max(0.70, min(1.40, ratio ** 0.35))
 
         requested = (
             packet_target_bps
@@ -524,12 +448,10 @@ class BitrateController:
             * feedback_factor
         )
 
-        return int(
-            max(
-                MIN_BITRATE_BPS,
-                min(MAX_BITRATE_BPS, requested),
-            )
-        )
+        return int(max(
+            MIN_BITRATE_BPS,
+            min(MAX_BITRATE_BPS, requested),
+        ))
 
     def record_packet(self, packet_bytes, frame_samples):
         self.total_packet_bytes += int(packet_bytes)
@@ -537,74 +459,55 @@ class BitrateController:
 
 
 # ============================================================
-# Encoding
+# Encode packets
 # ============================================================
 
 def encode_packets(
-    opus,
-    args,
-    frames,
-    modes,
-    frame_samples,
-    cbr=False,
-    targets=None,
+    opus, args, frames, modes, analysis_frames, frame_samples,
+    cbr=False, targets=None,
 ):
+    channels = output_channels(args)
     encoder, pre_skip = create_encoder(opus, args, cbr=cbr)
 
     controller = BitrateController(
-        args.bitrate,
-        args.vbr_intensity,
+        args.bitrate, args.vbr_intensity, channels
     )
 
     packets = []
     rates = []
     packet_bytes_total = 0
-
     output_buffer = (ctypes.c_ubyte * MAX_PACKET_BYTES)()
 
     try:
         for i, (frame, actual_samples) in enumerate(frames):
             mode = modes[i]
 
-            # Select channel coding and bandwidth for this frame.
-            opus_ctl(
-                opus,
-                encoder,
-                OPUS_SET_FORCE_CHANNELS_REQUEST,
-                1 if mode["mono"] else 2,
-            )
+            if channels == 2:
+                opus_ctl(
+                    opus, encoder, OPUS_SET_FORCE_CHANNELS_REQUEST,
+                    1 if mode["mono"] else 2,
+                )
 
             opus_ctl(
-                opus,
-                encoder,
-                OPUS_SET_MAX_BANDWIDTH_REQUEST,
-                (
-                    OPUS_BANDWIDTH_SUPERWIDEBAND
-                    if mode["swb"]
-                    else OPUS_BANDWIDTH_FULLBAND
-                ),
+                opus, encoder, OPUS_SET_MAX_BANDWIDTH_REQUEST,
+                OPUS_BANDWIDTH_SUPERWIDEBAND
+                if mode["swb"] else OPUS_BANDWIDTH_FULLBAND,
             )
 
             if targets is None:
                 requested = controller.bitrate_for_frame(
-                    frame,
-                    mode_multiplier(mode, args),
+                    analysis_frames[i], mode_multiplier(mode, args)
                 )
             else:
                 requested = targets[i]
 
-            requested = int(
-                max(
-                    MIN_BITRATE_BPS,
-                    min(MAX_BITRATE_BPS, requested),
-                )
-            )
+            requested = int(max(
+                MIN_BITRATE_BPS,
+                min(MAX_BITRATE_BPS, requested),
+            ))
 
             opus_ctl(
-                opus,
-                encoder,
-                OPUS_SET_BITRATE_REQUEST,
-                requested,
+                opus, encoder, OPUS_SET_BITRATE_REQUEST, requested
             )
 
             pcm_ptr = frame.ctypes.data_as(
@@ -612,11 +515,8 @@ def encode_packets(
             )
 
             packet_length = opus.opus_encode(
-                encoder,
-                pcm_ptr,
-                frame_samples,
-                output_buffer,
-                MAX_PACKET_BYTES,
+                encoder, pcm_ptr, frame_samples,
+                output_buffer, MAX_PACKET_BYTES,
             )
 
             if packet_length < 0:
@@ -625,18 +525,11 @@ def encode_packets(
                 )
 
             packet = bytes(output_buffer[:packet_length])
-
             packets.append(packet)
             packet_bytes_total += packet_length
+            rates.append(packet_length * 8.0 * RATE / frame_samples)
 
-            rates.append(
-                packet_length * 8.0 * RATE / frame_samples
-            )
-
-            controller.record_packet(
-                packet_length,
-                frame_samples,
-            )
+            controller.record_packet(packet_length, frame_samples)
 
     finally:
         opus.opus_encoder_destroy(encoder)
@@ -645,7 +538,7 @@ def encode_packets(
 
 
 # ============================================================
-# Ogg Opus writer
+# Ogg writer
 # ============================================================
 
 def make_ogg_crc_table():
@@ -656,9 +549,7 @@ def make_ogg_crc_table():
 
         for _ in range(8):
             if value & 0x80000000:
-                value = (
-                    (value << 1) ^ 0x04C11DB7
-                ) & 0xFFFFFFFF
+                value = ((value << 1) ^ 0x04C11DB7) & 0xFFFFFFFF
             else:
                 value = (value << 1) & 0xFFFFFFFF
 
@@ -707,23 +598,14 @@ class OggWriter:
         if len(lacing) > 255:
             raise ValueError("Ogg page exceeds 255 segments")
 
-        header = bytearray(
-            struct.pack(
-                "<4sBBqIIIB",
-                b"OggS",
-                0,
-                header_type,
-                granule,
-                self.serial,
-                self.sequence,
-                0,
-                len(lacing),
-            )
-        )
+        header = bytearray(struct.pack(
+            "<4sBBqIIIB",
+            b"OggS", 0, header_type, granule,
+            self.serial, self.sequence, 0, len(lacing),
+        ))
 
         header.extend(bytes(lacing))
         page = header + b"".join(bodies)
-
         struct.pack_into("<I", page, 22, ogg_crc(page))
 
         self.file.write(page)
@@ -765,19 +647,10 @@ class OggWriter:
         self.flush_audio(eos=True)
 
 
-def make_opus_head(pre_skip):
-    # A two-channel mapping-family-0 stream remains stereo-configured.
+def make_opus_head(pre_skip, channels=2):
     return (
         b"OpusHead"
-        + struct.pack(
-            "<BBHIhB",
-            1,
-            2,
-            pre_skip,
-            RATE,
-            0,
-            0,
-        )
+        + struct.pack("<BBHIhB", 1, channels, pre_skip, RATE, 0, 0)
     )
 
 
@@ -792,42 +665,37 @@ def make_opus_tags():
     )
 
 
-def write_ogg(path, packets, pre_skip, total_samples, frame_samples):
+def write_ogg(
+    path, packets, pre_skip, total_samples, frame_samples, channels
+):
     with open(path, "wb") as output_file:
         ogg = OggWriter(output_file)
 
         ogg.write_header_packet(
-            make_opus_head(pre_skip),
-            0,
-            header_type=2,
+            make_opus_head(pre_skip, channels), 0, header_type=2
         )
-
         ogg.write_header_packet(make_opus_tags(), 0)
 
         for i, packet in enumerate(packets):
-            decoded_end = min(
-                (i + 1) * frame_samples,
-                total_samples,
+            decoded_end = min((i + 1) * frame_samples, total_samples)
+            duration = min(
+                frame_samples,
+                max(0, total_samples - i * frame_samples),
             )
 
             ogg.add_audio_packet(
-                packet,
-                pre_skip + decoded_end,
-                frame_samples,
+                packet, pre_skip + decoded_end, duration
             )
 
         ogg.finish()
 
 
 # ============================================================
-# Pass 2 bitrate-pattern transformation
+# Two-pass bitrate pattern
 # ============================================================
 
 def transform_pass1_pattern(
-    pass1_rates,
-    adjustment,
-    offset_bps,
-    multiplier,
+    pass1_rates, adjustment, offset_bps, multiplier
 ):
     result = []
 
@@ -838,55 +706,39 @@ def transform_pass1_pattern(
             else rate * multiplier
         )
 
-        result.append(
-            int(
-                max(
-                    MIN_BITRATE_BPS,
-                    min(MAX_BITRATE_BPS, round(value)),
-                )
-            )
-        )
+        result.append(int(max(
+            MIN_BITRATE_BPS,
+            min(MAX_BITRATE_BPS, round(value)),
+        )))
 
     return result
 
 
 def measure_file(path, duration):
     size = os.path.getsize(path)
+    rate = size * 8.0 / duration if duration > 0 else 0.0
+    return size, rate
 
-    return size, (size * 8.0 / duration if duration > 0 else 0.0)
 
-
-# ============================================================
-# Two-pass encoding
-# ============================================================
-
-def run_two_pass(opus, args, frames, modes, frame_samples, total_samples):
+def run_two_pass(
+    opus, args, frames, modes, analysis_frames,
+    frame_samples, total_samples,
+):
     duration = total_samples / RATE
-
     multipliers = [
-        mode_multiplier(mode, args)
-        for mode in modes
+        mode_multiplier(mode, args) for mode in modes
     ]
-
     average_multiplier = float(np.mean(multipliers))
     effective_target = args.bitrate * average_multiplier
     target_file_bps = effective_target * 1000.0
 
-    print("\nPASS 1: adaptive VBR with per-frame mode switching")
-
-    packets, pass1_rates, packet_bytes, pre_skip = encode_packets(
-        opus,
-        args,
-        frames,
-        modes,
-        frame_samples,
-        cbr=False,
+    print("\nPASS 1: adaptive VBR analysis")
+    packets, pass1_rates, _, _ = encode_packets(
+        opus, args, frames, modes, analysis_frames, frame_samples
     )
-
     del packets
 
     pass1_mean = float(np.mean(pass1_rates))
-
     print(f"Pass 1 mean packet rate: {pass1_mean / 1000:.3f} kbps")
     print(f"Average mode multiplier: {average_multiplier:.3f}x")
     print(f"Effective target:        {effective_target:.3f} kbps")
@@ -903,41 +755,33 @@ def run_two_pass(opus, args, frames, modes, frame_samples, total_samples):
         offset_bps = 0.0
         multiplier = (
             target_packet_bps / pass1_mean
-            if pass1_mean > 0
-            else 1.0
+            if pass1_mean > 0 else 1.0
         )
 
     best_path = args.output + ".opusplus-best.tmp"
     best_error = float("inf")
     best_info = None
+    channels = output_channels(args)
 
-    print(f"\nPASS 2: {args.pass_adjust} adjustment; replaying mode pattern")
+    print(
+        f"\nPASS 2: {args.pass_adjust} adjustment; "
+        "replaying pass-1 pattern"
+    )
 
     try:
         for iteration in range(args.pass_iterations):
             targets = transform_pass1_pattern(
-                pass1_rates,
-                args.pass_adjust,
-                offset_bps,
-                multiplier,
+                pass1_rates, args.pass_adjust, offset_bps, multiplier
             )
 
-            packets, rates, packet_bytes, pre_skip = encode_packets(
-                opus,
-                args,
-                frames,
-                modes,
-                frame_samples,
-                cbr=True,
-                targets=targets,
+            packets, _, packet_bytes, pre_skip = encode_packets(
+                opus, args, frames, modes, analysis_frames,
+                frame_samples, cbr=True, targets=targets,
             )
 
             write_ogg(
-                args.output,
-                packets,
-                pre_skip,
-                total_samples,
-                frame_samples,
+                args.output, packets, pre_skip,
+                total_samples, frame_samples, channels,
             )
 
             size, file_rate = measure_file(args.output, duration)
@@ -954,12 +798,8 @@ def run_two_pass(opus, args, frames, modes, frame_samples, total_samples):
             if abs(error_bps) < best_error:
                 best_error = abs(error_bps)
                 shutil.copyfile(args.output, best_path)
-
                 best_info = (
-                    size,
-                    file_rate,
-                    packet_rate,
-                    iteration + 1,
+                    size, file_rate, packet_rate, iteration + 1
                 )
 
             if abs(error_bps) <= args.pass_tolerance_kbps * 1000.0:
@@ -974,7 +814,6 @@ def run_two_pass(opus, args, frames, modes, frame_samples, total_samples):
                 -MAX_BITRATE_BPS,
                 min(MAX_BITRATE_BPS, offset_bps),
             )
-
             multiplier = max(0.05, min(20.0, multiplier))
 
     finally:
@@ -1005,35 +844,25 @@ def run_two_pass(opus, args, frames, modes, frame_samples, total_samples):
     }
 
 
-# ============================================================
-# Single-pass encoding
-# ============================================================
-
-def run_single_pass(opus, args, frames, modes, frame_samples, total_samples):
+def run_single_pass(
+    opus, args, frames, modes, analysis_frames,
+    frame_samples, total_samples,
+):
     duration = total_samples / RATE
+    channels = output_channels(args)
 
     packets, rates, packet_bytes, pre_skip = encode_packets(
-        opus,
-        args,
-        frames,
-        modes,
-        frame_samples,
-        cbr=False,
+        opus, args, frames, modes, analysis_frames, frame_samples
     )
 
     write_ogg(
-        args.output,
-        packets,
-        pre_skip,
-        total_samples,
-        frame_samples,
+        args.output, packets, pre_skip,
+        total_samples, frame_samples, channels,
     )
 
     size, file_rate = measure_file(args.output, duration)
-
     average_multiplier = float(np.mean([
-        mode_multiplier(mode, args)
-        for mode in modes
+        mode_multiplier(mode, args) for mode in modes
     ]))
 
     return {
@@ -1049,7 +878,7 @@ def run_single_pass(opus, args, frames, modes, frame_samples, total_samples):
 
 
 # ============================================================
-# Main
+# Main workflow
 # ============================================================
 
 def encode(args):
@@ -1077,88 +906,92 @@ def encode(args):
     if not 0.05 <= args.swb_multiplier <= 1.0:
         raise ValueError("SWB multiplier must be between 0.05 and 1.0")
 
-    frame_samples = int(RATE * args.frame_ms / 1000.0)
+    if not 0 <= args.vbr_normalize_level <= 10:
+        raise ValueError("VBR normalization level must be an integer from 0 to 10")
 
+    if args.vbr_normalize_gate < 0:
+        raise ValueError("Normalization gate cannot be negative")
+
+    channels = output_channels(args)
+    frame_samples = int(RATE * args.frame_ms / 1000.0)
     started = time.time()
 
     print(f"Input:  {args.input}")
     print(f"Output: {args.output}")
-    print("Decoding to stereo 48 kHz PCM...")
+    print(f"Output channels: {'mono' if channels == 1 else 'stereo'}")
+    print("Decoding audio...")
 
-    pcm = decode_input(args.input)
-    total_samples = len(pcm) // 2
-    frames = make_frames(pcm, frame_samples)
+    pcm = decode_input(args.input, pure_mono=args.pure_mono)
+    total_samples = len(pcm) // channels
+    frames = make_frames(pcm, frame_samples, channels)
 
-    # Detect all frame modes once, then replay them in Pass 2.
+    # Analysis copy only. The original frames remain untouched.
+    analysis_frames = normalize_analysis_frames(frames, args, channels)
     modes = analyze_all_modes(frames, args)
 
     mono_count = sum(mode["mono"] for mode in modes)
     swb_count = sum(mode["swb"] for mode in modes)
-    both_count = sum(mode["mono"] and mode["swb"] for mode in modes)
+    both_count = sum(
+        mode["mono"] and mode["swb"] for mode in modes
+    )
 
     opus = configure_opus_functions(load_opus(args.opus_dll))
 
-    if hasattr(opus, "opus_get_version_string"):
-        version = opus.opus_get_version_string().decode(
-            "ascii",
-            errors="replace",
-        )
-    else:
-        version = "unknown"
+    version = (
+        opus.opus_get_version_string().decode("ascii", errors="replace")
+        if hasattr(opus, "opus_get_version_string")
+        else "unknown"
+    )
 
-    print(f"Encoder:            OpusPlus")
-    print(f"libopus:            {version}")
-    print(f"Reference bitrate:  {args.bitrate:.3f} kbps")
-    print(f"Frame duration:     {args.frame_ms:g} ms")
-    print(f"Frames:             {len(frames)}")
-    print(f"Duration:           {total_samples / RATE:.3f} sec")
-    print(f"Signal mode:        {args.mode}")
-    print(f"VBR intensity:      {args.vbr_intensity}/10")
-    print(f"Complexity:         {args.complexity}/10")
+    print(f"Encoder:             OpusPlus")
+    print(f"libopus:             {version}")
+    print(f"Reference bitrate:   {args.bitrate:.3f} kbps")
+    print(f"Frame duration:      {args.frame_ms:g} ms")
+    print(f"Frames:              {len(frames)}")
+    print(f"Duration:            {total_samples / RATE:.3f} sec")
+    print(f"Signal mode:         {args.mode}")
+    print(f"VBR intensity:       {args.vbr_intensity}/10")
+    print(f"Complexity:          {args.complexity}/10")
+    print(f"Pure mono:           {'ON' if args.pure_mono else 'OFF'}")
+    print(f"VBR normalization:   {'ON' if args.vbr_normalize else 'OFF'}")
+    print(f"Normalization level: {args.vbr_normalize_level}/10")
+    print(f"Normalization gate:  {args.vbr_normalize_gate} PCM units")
 
     print("\nPER-FRAME MODE ANALYSIS")
-    print(f"Mono-coded frames:  {mono_count}/{len(frames)}")
-    print(f"SWB frames:         {swb_count}/{len(frames)}")
-    print(f"Mono + SWB frames:  {both_count}/{len(frames)}")
-    print(f"Mono multiplier:    {args.mono_multiplier:.3f}x")
-    print(f"SWB multiplier:     {args.swb_multiplier:.3f}x")
+    print(f"Mono-coded frames:   {mono_count}/{len(frames)}")
+    print(f"SWB frames:          {swb_count}/{len(frames)}")
+    print(f"Mono + SWB frames:   {both_count}/{len(frames)}")
+    print(f"Mono multiplier:     {args.mono_multiplier:.3f}x")
+    print(f"SWB multiplier:      {args.swb_multiplier:.3f}x")
 
     if args.pass_mode == "two-pass":
         result = run_two_pass(
-            opus,
-            args,
-            frames,
-            modes,
-            frame_samples,
-            total_samples,
+            opus, args, frames, modes, analysis_frames,
+            frame_samples, total_samples,
         )
     else:
         result = run_single_pass(
-            opus,
-            args,
-            frames,
-            modes,
-            frame_samples,
-            total_samples,
+            opus, args, frames, modes, analysis_frames,
+            frame_samples, total_samples,
         )
 
     print("\nOpusPlus encoding complete.")
     print(f"Duration:             {result['duration']:.3f} sec")
-    print(f"Output size:           {result['file_size']:,} bytes")
-    print(f"Audio packet rate:     {result['packet_rate'] / 1000:.3f} kbps")
-    print(f"Total file rate:       {result['file_rate'] / 1000:.3f} kbps")
-    print(f"Reference target:      {args.bitrate:.3f} kbps")
-    print(f"Effective target:      {result['effective_target']:.3f} kbps")
-    print(f"Average multiplier:    {result['average_multiplier']:.3f}x")
+    print(f"Output size:          {result['file_size']:,} bytes")
+    print(f"Audio packet rate:    {result['packet_rate'] / 1000:.3f} kbps")
+    print(f"Total file rate:      {result['file_rate'] / 1000:.3f} kbps")
+    print(f"Reference target:     {args.bitrate:.3f} kbps")
+    print(f"Effective target:     {result['effective_target']:.3f} kbps")
+    print(f"Average multiplier:   {result['average_multiplier']:.3f}x")
     print(
-        f"Difference from effective target: "
+        "Difference from effective target: "
         f"{result['file_rate'] / 1000 - result['effective_target']:+.3f} kbps"
     )
 
     if args.pass_mode == "two-pass":
-        print(f"Best iteration:        {result['best_iteration']}")
+        print(f"Best iteration:       {result['best_iteration']}")
 
-    print(f"Elapsed time:          {time.time() - started:.2f} sec")
+    print(f"Elapsed time:         {time.time() - started:.2f} sec")
 
 
 # ============================================================
@@ -1168,121 +1001,63 @@ def encode(args):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "OpusPlus: adaptive per-frame bandwidth/channel coding "
-            "with bitrate-pattern correction."
+            "OpusPlus adaptive encoder with per-frame "
+            "analysis-only peak normalization."
         )
     )
 
     parser.add_argument("input", help="Input audio file")
     parser.add_argument("output", help="Output .opus file")
+    parser.add_argument("-b", "--bitrate", type=float, default=32)
 
     parser.add_argument(
-        "-b", "--bitrate",
-        type=float,
-        default=32,
-        help="Reference target bitrate in kbps (default: 32)",
+        "--pure-mono", action="store_true",
+        help="Encode a genuine one-channel Opus stream",
     )
 
     parser.add_argument(
-        "--pass-mode",
-        choices=["live", "two-pass"],
-        default="two-pass",
+        "--pass-mode", choices=["live", "two-pass"], default="two-pass"
+    )
+    parser.add_argument(
+        "--pass-adjust", choices=["add", "multiply"], default="multiply"
+    )
+    parser.add_argument("--pass-iterations", type=int, default=4)
+    parser.add_argument("--pass-tolerance-kbps", type=float, default=0.5)
+
+    parser.add_argument("--mono-multiplier", type=float, default=0.50)
+    parser.add_argument("--swb-multiplier", type=float, default=0.70)
+    parser.add_argument("--mono-enter-db", type=float, default=-45.0)
+    parser.add_argument("--mono-exit-db", type=float, default=-38.0)
+    parser.add_argument("--swb-enter-db", type=float, default=-45.0)
+    parser.add_argument("--swb-exit-db", type=float, default=-40.0)
+    parser.add_argument("--silence-threshold", type=float, default=8.0)
+
+    parser.add_argument(
+        "--vbr-normalize", action="store_true",
+        help="Enable per-frame peak normalization for VBR analysis only",
+    )
+    parser.add_argument(
+        "--vbr-normalize-level", type=int, choices=range(11), default=10,
+        help="Normalization intensity: 0=off, 10=full peak normalization",
+    )
+    parser.add_argument(
+        "--vbr-normalize-gate", type=float, default=8.0,
+        help="Leave frames with peaks at or below this PCM level unchanged",
     )
 
     parser.add_argument(
-        "--pass-adjust",
-        choices=["add", "multiply"],
-        default="multiply",
+        "--vbr-intensity", type=int, choices=range(11), default=10
     )
-
     parser.add_argument(
-        "--pass-iterations",
-        type=int,
-        default=4,
+        "--complexity", type=int, choices=range(11), default=10
     )
-
     parser.add_argument(
-        "--pass-tolerance-kbps",
-        type=float,
-        default=0.5,
+        "--frame-ms", type=float,
+        choices=[2.5, 5, 10, 20, 40, 60], default=20,
     )
-
     parser.add_argument(
-        "--mono-multiplier",
-        type=float,
-        default=0.80,
-        help="Per-frame bitrate multiplier for mono coding (default: 0.80)",
+        "--mode", choices=["auto", "music", "voice"], default="music"
     )
-
-    parser.add_argument(
-        "--swb-multiplier",
-        type=float,
-        default=0.80,
-        help="Per-frame bitrate multiplier for SWB (default: 0.80)",
-    )
-
-    parser.add_argument(
-        "--mono-enter-db",
-        type=float,
-        default=-45.0,
-        help="Enter mono when side signal is below this dB level",
-    )
-
-    parser.add_argument(
-        "--mono-exit-db",
-        type=float,
-        default=-41.0,
-        help="Return to stereo when side signal exceeds this dB level",
-    )
-
-    parser.add_argument(
-        "--swb-enter-db",
-        type=float,
-        default=-45.0,
-        help="Enter SWB when high-band energy is below this dB level",
-    )
-
-    parser.add_argument(
-        "--swb-exit-db",
-        type=float,
-        default=-41.0,
-        help="Return to fullband when high-band energy exceeds this dB level",
-    )
-
-    parser.add_argument(
-        "--silence-threshold",
-        type=float,
-        default=8.0,
-        help="RMS threshold below which a frame is treated as silence",
-    )
-
-    parser.add_argument(
-        "--vbr-intensity",
-        type=int,
-        choices=range(11),
-        default=10,
-    )
-
-    parser.add_argument(
-        "--complexity",
-        type=int,
-        choices=range(11),
-        default=10,
-    )
-
-    parser.add_argument(
-        "--frame-ms",
-        type=float,
-        choices=[2.5, 5, 10, 20, 40, 60],
-        default=20,
-    )
-
-    parser.add_argument(
-        "--mode",
-        choices=["auto", "music", "voice"],
-        default="music",
-    )
-
     parser.add_argument("--opus-dll", default=None)
 
     args = parser.parse_args()
@@ -1297,7 +1072,7 @@ def main():
         sys.exit(1)
 
 
-if __name__ == "__main__":
+if __name__ == "f__main__":
     try:
         main()
     except Exception:
