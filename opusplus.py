@@ -515,9 +515,9 @@ class BitrateController:
             return int(packet_target_bps)
 
         activity, transient = analyze_frame(analysis_frame, self.channels)
-        strength = self.intensity / 10.0
-        activity_factor = 1.0 + strength * ((activity - 0.45) * 0.90)
-        transient_factor = 1.0 + strength * 0.40 * transient
+        strength = self.intensity / 4
+        activity_factor = 1.0 + strength * ((activity - 0.45) * 0.75)
+        transient_factor = 1.0 + strength * 1.5 * transient
         activity_factor = max(0.75, min(1.50, activity_factor))
         transient_factor = max(1.0, min(1.40, transient_factor))
 
