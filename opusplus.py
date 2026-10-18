@@ -1203,8 +1203,8 @@ def main():
         "--vbr-intensity",
         type=int,
         choices=range(0, 11),
-        default=5,
-        help="Activity/transient allocation strength, 0–10 (default: 5)",
+        default=10,
+        help="Activity/transient allocation strength, 0–10 (default: 10)",
     )
 
     parser.add_argument(
@@ -1226,7 +1226,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["auto", "music", "voice"],
-        default="auto",
+        default="music",
         help="Encoder signal hint (default: auto)",
     )
 
