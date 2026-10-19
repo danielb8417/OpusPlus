@@ -36,12 +36,12 @@ OPUS_BANDWIDTH_WIDEBAND = 1103
 OPUS_BANDWIDTH_SUPERWIDEBAND = 1104
 OPUS_BANDWIDTH_FULLBAND = 1105
 
-MIN_BITRATE_BPS = 6000
+MIN_BITRATE_BPS = 500
 MAX_BITRATE_BPS = 512000
 OGG_OVERHEAD_ESTIMATE_BPS = 250
 MAX_PACKET_BYTES = 1275 * 3
 SWB_MONO_GUARD_KBPS = 12.0
-STEREO_MIN_BITRATE_BPS = 17000
+STEREO_MIN_BITRATE_BPS = 10000
 
 
 def vprint(args, *values, **kwargs):
@@ -49,8 +49,13 @@ def vprint(args, *values, **kwargs):
         print(*values, **kwargs)
 
 
+def auto_mono_enabled(args):
+    """Use a genuine mono stream at <=16 kbps, unless already requested."""
+    return bool(args.pure_mono or args.bitrate <= 16.0)
+
+
 def output_channels(args):
-    return 1 if args.pure_mono else CHANNELS
+    return 1 if auto_mono_enabled(args) else CHANNELS
 
 
 def resolve_codec_strategy(args):
@@ -388,6 +393,7 @@ def find_ffmpeg():
 
 
 def decode_input(path, pure_mono=False):
+    # FFmpeg downmixes to one channel before analysis/encoding when mono is on.
     channels = 1 if pure_mono else 2
 
     command = [
@@ -753,14 +759,27 @@ class BitrateController:
 # ============================================================
 
 def select_bandwidth(args, mode):
-    # At or below 6.5 kbps, use CELT wideband on every frame.
-    # CELT-only is forced separately by create_encoder().
-    if args.bitrate <= 6.5:
+    # Explicit override modes ignore the usual low-bitrate bandwidth policy.
+    # These are encoder requests; libopus may still internally limit the
+    # effective bandwidth when the requested bitrate is extremely low.
+    if args.bandwidth_mode == "wideband":
+        return OPUS_BANDWIDTH_WIDEBAND
+    if args.bandwidth_mode == "swb":
+        return OPUS_BANDWIDTH_SUPERWIDEBAND
+    if args.bandwidth_mode == "fullband":
+        return OPUS_BANDWIDTH_FULLBAND
+    if args.bandwidth_mode == "auto":
+        return (
+            OPUS_BANDWIDTH_SUPERWIDEBAND
+            if mode["swb"] else OPUS_BANDWIDTH_FULLBAND
+        )
+
+    # Default policy: at or below 6 kbps, request CELT wideband.
+    if args.bitrate <= 6.0:
         return OPUS_BANDWIDTH_WIDEBAND
 
-    # Above 6.5 and below 16 kbps, default to SWB on every frame.
-    # The optional adaptive mode permits FB except on SWB-detected frames.
-    if args.bitrate < 16.0:
+    # Above 6 and below 10 kbps, default to SWB on every frame.
+    if args.bitrate < 10.0:
         if not args.adaptive_swb:
             return OPUS_BANDWIDTH_SUPERWIDEBAND
         return (
@@ -768,16 +787,20 @@ def select_bandwidth(args, mode):
             if mode["swb"] else OPUS_BANDWIDTH_FULLBAND
         )
 
-    # At 16 kbps and above, retain the existing detector/strategy behavior.
     if args.codec_strategy == "swb" or mode["swb"]:
         return OPUS_BANDWIDTH_SUPERWIDEBAND
-
     return OPUS_BANDWIDTH_FULLBAND
 
 
 def select_max_bandwidth(args):
-    # Apply the same hard ceiling as the per-frame request. Without this,
-    # libopus may choose a wider bandwidth than the requested one.
+    # Explicit override modes also lift the script's normal low-rate ceiling.
+    if args.bandwidth_mode in ("auto", "fullband"):
+        return OPUS_BANDWIDTH_FULLBAND
+    if args.bandwidth_mode == "swb":
+        return OPUS_BANDWIDTH_SUPERWIDEBAND
+    if args.bandwidth_mode == "wideband":
+        return OPUS_BANDWIDTH_WIDEBAND
+
     if args.bitrate <= 6.5:
         return OPUS_BANDWIDTH_WIDEBAND
     if args.bitrate < 16.0 and not args.adaptive_swb:
@@ -842,13 +865,18 @@ def encode_packets(
                     int(args.phase_invert_floor_kbps * 1000),
                 )
 
-            # Keep genuinely stereo frames at or above 17 kbps so adaptive
-            # VBR does not starve the stereo image. Frames detected as mono
-            # or mostly mono may use the lower adaptive bitrate.
-            frame_is_mono = channels == 2 and mode["mono"] and not phase_inverted
-            if channels == 2 and not frame_is_mono:
-                requested = max(requested, STEREO_MIN_BITRATE_BPS)
+            # At <=16 kbps, automatically use mono coding for ordinary
+            # content to concentrate the limited bits. Above 16 kbps, use
+            # the mono/mostly-mono detector. Phase-inverted material stays
+            # stereo so its side-channel information is not collapsed.
+            frame_is_mono = (
+                channels == 2
+                and not phase_inverted
+                and (args.bitrate <= 16.0 or mode["mono"])
+            )
 
+            # Stereo floor is intentionally disabled in this settings variant.
+            # STEREO_MIN_BITRATE_BPS remains available if the floor is re-enabled.
             requested = min(MAX_BITRATE_BPS, requested)
 
             opus_ctl(
@@ -1273,8 +1301,8 @@ def encode(args):
     if not os.path.isfile(args.input):
         raise FileNotFoundError(f"Input not found: {args.input}")
 
-    if not 6 <= args.bitrate <= 512:
-        raise ValueError("Bitrate must be between 6 and 512 kbps")
+    if not 0.5 <= args.bitrate <= 512:
+        raise ValueError("Bitrate must be between 0.5 and 512 kbps (Opus minimum is 500 bps)")
 
     if not 24 <= args.phase_invert_floor_kbps <= 28:
         raise ValueError(
@@ -1331,15 +1359,21 @@ def encode(args):
     print(f"Output:         {args.output}")
     print("Encoder:        OpusPlus")
     print(f"Channels:       {'mono' if channels == 1 else 'stereo'}")
+    if args.bitrate <= 16.0 and not args.pure_mono:
+        print("WARNING: AUTO MONO ACTIVATED — target is <=16 kbps.")
+        print("         Input will be downmixed and encoded as a true mono Opus stream (OpusHead channel count = 1).")
+    elif args.pure_mono:
+        print("WARNING: PURE MONO ENABLED — output will be a true mono Opus stream (OpusHead channel count = 1).")
     print(f"Target bitrate: {args.bitrate:g} kbps")
     print(f"Strategy:       {args.codec_strategy.upper()}")
     print(f"Pass mode:      {args.pass_mode}")
 
     vprint(args, "\nREQUESTED CODING MODE: CELT-ONLY")
-    vprint(args, "Force-mode control:     experimental libopus request")
+    vprint(args, "Bandwidth forcing:      standard libopus bandwidth controls")
+    vprint(args, "CELT-only forcing:      uses private libopus force-mode request; build-dependent")
     vprint(args, "Hybrid bitrate band:    removed")
-    vprint(args, "Stereo bitrate floor:   17.0 kbps (stereo output only)")
-    vprint(args, "Stereo channel policy:  always stereo; no detector collapse")
+    vprint(args, "Stereo bitrate floor:   disabled in current settings")
+    vprint(args, "Channel policy:         true mono stream at <=16 kbps; stereo above 16 kbps unless --pure-mono")
     vprint(args, f"Frame duration:         {args.frame_ms:g} ms")
     vprint(args, f"Signal mode:            MUSIC")
     vprint(args, f"VBR intensity:          {args.vbr_intensity}/10")
@@ -1379,22 +1413,29 @@ def encode(args):
         f"Mono reduction guard:    {SWB_MONO_GUARD_KBPS:.1f} kbps",
     )
     vprint(args, "Low-rate VBR strength:   scaled proportionally below 16 kbps")
-    if args.bitrate <= 6.5:
-        low_rate_bandwidth = "forced CELT wideband (<= 6.5 kbps)"
-    elif args.bitrate < 16.0:
+    if args.bandwidth_mode != "default":
+        low_rate_bandwidth = f"override: {args.bandwidth_mode.upper()}"
+    elif args.bitrate <= 6.0:
+        low_rate_bandwidth = "default: CELT wideband (<= 6 kbps)"
+    elif args.bitrate < 10.0:
         low_rate_bandwidth = (
-            "detector-adaptive SWB/FB"
-            if args.adaptive_swb else "SWB on every frame"
+            "default: detector-adaptive SWB/FB"
+            if args.adaptive_swb else "default: SWB on every frame"
         )
     else:
-        low_rate_bandwidth = "Detector/strategy controlled"
+        low_rate_bandwidth = "default: detector/strategy controlled"
     vprint(args, f"Bandwidth policy:        {low_rate_bandwidth}")
+    if args.bandwidth_mode != "default" and args.bitrate <= 6.0:
+        print(
+            "WARNING: bandwidth override requested at <=6 kbps. "
+            "libopus may still limit the effective bandwidth at this rate."
+        )
 
     if requested_strategy == "auto":
         vprint(args, "Automatic rule:          CELT-only at all target bitrates")
 
     print("Decoding audio...")
-    pcm = decode_input(args.input, pure_mono=args.pure_mono)
+    pcm = decode_input(args.input, pure_mono=(channels == 1))
 
     total_samples = len(pcm) // channels
     frames = make_frames(pcm, frame_samples, channels)
@@ -1476,7 +1517,7 @@ def encode(args):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "OpusPlus adaptive encoder with experimental CELT-only mode, "
+            "OpusPlus adaptive encoder with CELT-only mode, "
             "low-rate VBR smoothing, adaptive channel coding, "
             "phase-inversion protection, two-pass targeting, "
             "and verbose packet analysis."
@@ -1488,11 +1529,11 @@ def main():
 
     parser.add_argument(
         "-b", "--bitrate", type=float, default=18,
-        help="Target bitrate in kbps",
+        help="Target bitrate in kbps (0.5-512; Opus minimum is 500 bps)",
     )
     parser.add_argument(
         "--pure-mono", action="store_true",
-        help="Encode a genuine single-channel Opus stream",
+        help="Force a genuine single-channel Opus stream at any bitrate",
     )
 
     parser.add_argument(
@@ -1591,6 +1632,16 @@ def main():
         help=(
             "Below 16 kbps, use SWB only on frames flagged by the SWB "
             "detector and allow fullband on other frames; default is all SWB"
+        ),
+    )
+    parser.add_argument(
+        "--bandwidth-mode",
+        choices=["default", "auto", "swb", "fullband", "wideband"],
+        default="default",
+        help=(
+            "Bandwidth policy: default follows bitrate rules; auto chooses "
+            "SWB or fullband per frame at ANY bitrate; swb/fullband/wideband "
+            "request that bandwidth even at very low bitrates"
         ),
     )
 
