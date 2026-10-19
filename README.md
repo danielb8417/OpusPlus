@@ -1,6 +1,6 @@
 # OpusPlus
 
-Opus+ is an Opus encoder that allows Opus files to be in higher quality, sometimes even beating xHE-AAC.
+Opus+ is an Opus encoder that allows Opus files to be in a higher quality, sometimes even beating xHE-AAC.
 
 --------------- Dependencies ---------------
 
@@ -10,9 +10,9 @@ Python (any modern version should work)
 
 NumPy
 
-Opus.dll in PATH
+Opus.dll in PATH or on MacOS use brew install opus or sudo apt install opus
 
-ffmpeg in PATH (https://drive.google.com/file/d/1_ObJ_u9OBw5aSSEik3JsJu3LJ1uoyzY6/view?usp=sharing download link)
+ffmpeg in PATH or on MacOS use brew, Linux uses sudo apt. (if you need it: https://drive.google.com/file/d/1_ObJ_u9OBw5aSSEik3JsJu3LJ1uoyzY6/view?usp=sharing)
 
 
 --------------- How it works ---------------
