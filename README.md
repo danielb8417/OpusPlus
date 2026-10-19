@@ -29,5 +29,12 @@ Opus+ will also detect content with no noticeable stereo (basically mono) and wi
 
 I got the idea for Opus+ when I had a variable Opus encoder that would vary the bitrate through the whole song, but I was testing with no varying throughout the song I was testing with and noticed the quality was noticeably better. I looked into why this happened, and that's when I noticed the variable Opus encoder had a stronger VBR than FFmpeg. That's what gave me the whole idea to make Opus+.
 
-Mono recommended bitrate: 12-32kbps.
+Mono recommended bitrate: 10-32kbps.
 Stereo recommended bitrate: >24kbps.
+
+Bandwidths:
+Wideband (16 kHz sample rate) <=6kbps
+Superwideband (24 kHz sample rate) 6-10kbps
+Fullband (w/ SWB auto for SWB frames) >=10kbps
+
+Force fullband/SWB auto mode available, for all bitrates.
