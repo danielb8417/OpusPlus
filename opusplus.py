@@ -717,7 +717,7 @@ class BitrateController:
 
         # At 12 kbps this is 75% of normal strength.
         # At 8 kbps it is 50%; at 16 kbps and above it is unchanged.
-        low_rate_scale = min(1.0, self.target_kbps / 16.0)
+        low_rate_scale = min(1.0, self.target_kbps / 32.0)
         strength = (self.intensity / 4.0) * low_rate_scale
 
         activity_factor = (
@@ -1432,7 +1432,7 @@ def encode(args):
         args,
         f"Mono reduction guard:    {SWB_MONO_GUARD_KBPS:.1f} kbps",
     )
-    vprint(args, "Low-rate VBR strength:   scaled proportionally below 16 kbps")
+    vprint(args, "Low-rate VBR strength:   scaled proportionally below 32 kbps")
     if args.bandwidth_mode != "default":
         low_rate_bandwidth = f"override: {args.bandwidth_mode.upper()}"
     elif args.bitrate <= 5.0:
