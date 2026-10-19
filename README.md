@@ -33,8 +33,8 @@ Mono recommended bitrate: 10-32kbps. (not saying it'll sound like trash at 9.999
 Stereo recommended bitrate: >24kbps.
 
 Bandwidths:
-Wideband (16 kHz sample rate) <=6kbps
-Superwideband (24 kHz sample rate) 6-10kbps
+Wideband (16 kHz sample rate) <=5kbps
+Superwideband (24 kHz sample rate) 5-10kbps
 Fullband (w/ SWB auto for SWB frames) >=10kbps
 
 Force fullband/SWB auto mode available, for all bitrates.
