@@ -778,7 +778,7 @@ def select_bandwidth(args, mode):
         )
 
     # Default policy: at or below 6 kbps, request CELT wideband.
-    if args.bitrate <= 6.0:
+    if args.bitrate <= 5.0:
         return OPUS_BANDWIDTH_WIDEBAND
 
     # Above 6 and below 10 kbps, default to SWB on every frame.
@@ -804,7 +804,7 @@ def select_max_bandwidth(args):
     if args.bandwidth_mode == "wideband":
         return OPUS_BANDWIDTH_WIDEBAND
 
-    if args.bitrate <= 6.5:
+    if args.bitrate <= 5.0:
         return OPUS_BANDWIDTH_WIDEBAND
     if args.bitrate < 16.0 and not args.adaptive_swb:
         return OPUS_BANDWIDTH_SUPERWIDEBAND
@@ -1435,8 +1435,8 @@ def encode(args):
     vprint(args, "Low-rate VBR strength:   scaled proportionally below 16 kbps")
     if args.bandwidth_mode != "default":
         low_rate_bandwidth = f"override: {args.bandwidth_mode.upper()}"
-    elif args.bitrate <= 6.0:
-        low_rate_bandwidth = "default: CELT wideband (<= 6 kbps)"
+    elif args.bitrate <= 5.0:
+        low_rate_bandwidth = "default: CELT wideband (<= 5 kbps)"
     elif args.bitrate < 10.0:
         low_rate_bandwidth = (
             "default: detector-adaptive SWB/FB"
