@@ -28,3 +28,6 @@ Opus+ will also detect content with no noticeable stereo (basically mono) and wi
 --------------- How I got the idea (for those curious) --------------
 
 I got the idea for Opus+ when I had a variable Opus encoder that would vary the bitrate through the whole song, but I was testing with no varying throughout the song I was testing with and noticed the quality was noticeably better. I looked into why this happened, and that's when I noticed the variable Opus encoder had a stronger VBR than FFmpeg. That's what gave me the whole idea to make Opus+.
+
+Mono recommended bitrate: 12-32kbps.
+Stereo recommended bitrate: >24kbps.
