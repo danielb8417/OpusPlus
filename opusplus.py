@@ -27,6 +27,8 @@ OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST = 4046
 
 # Experimental libopus force-mode control.
 OPUS_SET_FORCE_MODE_REQUEST = 11002
+OPUS_MODE_SILK_ONLY = 1000
+OPUS_MODE_HYBRID = 1001
 OPUS_MODE_CELT_ONLY = 1002
 
 OPUS_AUTO = -1000
@@ -193,9 +195,8 @@ def create_encoder(opus, args, cbr=False):
         opus_ctl(
             opus, encoder, OPUS_SET_COMPLEXITY_REQUEST, args.complexity
         )
-        opus_ctl(
-            opus, encoder, OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_MUSIC
-        )
+        signal = OPUS_SIGNAL_VOICE if args.mode == "voice" else OPUS_SIGNAL_MUSIC
+        opus_ctl(opus, encoder, OPUS_SET_SIGNAL_REQUEST, signal)
         opus_ctl(
             opus, encoder, OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST, 1
         )
@@ -205,13 +206,15 @@ def create_encoder(opus, args, cbr=False):
                 opus, encoder, OPUS_SET_FORCE_CHANNELS_REQUEST, 2
             )
 
-        # This is an experimental/private libopus control in many builds.
-        # If unsupported, fail clearly instead of claiming CELT is forced.
-        opus_ctl(
-            opus, encoder,
-            OPUS_SET_FORCE_MODE_REQUEST,
-            OPUS_MODE_CELT_ONLY,
-        )
+        # The force-mode request is a private/build-dependent libopus control.
+        # Voice mode chooses SILK for wideband and Hybrid for SWB/fullband per frame.
+        # Music mode retains the existing CELT-only strategy.
+        if args.mode != "voice":
+            opus_ctl(
+                opus, encoder,
+                OPUS_SET_FORCE_MODE_REQUEST,
+                OPUS_MODE_CELT_ONLY,
+            )
 
         lookahead = ctypes.c_int(0)
         opus_ctl_pointer(
@@ -845,6 +848,18 @@ def encode_packets(
                 select_max_bandwidth(args),
             )
 
+            if args.mode == "voice":
+                # SILK is the voice-oriented mode for WB; Hybrid is used for
+                # SWB/FB. Apply per frame so auto bandwidth can switch modes.
+                forced_mode = (
+                    OPUS_MODE_SILK_ONLY
+                    if bandwidth == OPUS_BANDWIDTH_WIDEBAND
+                    else OPUS_MODE_HYBRID
+                )
+                opus_ctl(
+                    opus, encoder, OPUS_SET_FORCE_MODE_REQUEST, forced_mode
+                )
+
             if targets is None:
                 requested = controller.bitrate_for_frame(
                     analysis_frames[i],
@@ -1368,14 +1383,19 @@ def encode(args):
     print(f"Strategy:       {args.codec_strategy.upper()}")
     print(f"Pass mode:      {args.pass_mode}")
 
-    vprint(args, "\nREQUESTED CODING MODE: CELT-ONLY")
+    vprint(
+        args,
+        "\nREQUESTED CODING MODE: " + (
+            "SILK/HYBRID (voice)" if args.mode == "voice" else "CELT-ONLY (music)"
+        ),
+    )
     vprint(args, "Bandwidth forcing:      standard libopus bandwidth controls")
-    vprint(args, "CELT-only forcing:      uses private libopus force-mode request; build-dependent")
+    vprint(args, "Mode forcing:            uses private libopus force-mode request; build-dependent")
     vprint(args, "Hybrid bitrate band:    removed")
     vprint(args, "Stereo bitrate floor:   disabled in current settings")
     vprint(args, "Channel policy:         true mono stream at <=16 kbps; stereo above 16 kbps unless --pure-mono")
     vprint(args, f"Frame duration:         {args.frame_ms:g} ms")
-    vprint(args, f"Signal mode:            MUSIC")
+    vprint(args, f"Signal mode:            {args.mode.upper()}")
     vprint(args, f"VBR intensity:          {args.vbr_intensity}/10")
     vprint(args, f"Complexity:              {args.complexity}/10")
     vprint(args, f"Pure mono:               {'ON' if args.pure_mono else 'OFF'}")
@@ -1615,16 +1635,18 @@ def main():
     parser.add_argument(
         "--mode", choices=["auto", "music", "voice"],
         default="music",
-        help="Signal hint; CELT strategy uses MUSIC",
+        help=(
+            "Coding mode: music forces CELT-only; voice requests SILK at "
+            "wideband and Hybrid at superwideband/fullband"
+        ),
     )
     parser.add_argument(
         "--codec-strategy",
         choices=["auto", "swb", "celt"],
         default="auto",
         help=(
-            "auto: request CELT-only at all bitrates; "
-            "swb: CELT-only with SWB bandwidth limit; "
-            "celt: CELT-only with detector-controlled bandwidth"
+            "Music-mode CELT strategy: auto/celt force CELT-only; "
+            "swb forces CELT-only with SWB bandwidth limit. Ignored in voice mode."
         ),
     )
     parser.add_argument(
