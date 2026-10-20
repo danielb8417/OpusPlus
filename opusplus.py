@@ -2105,7 +2105,7 @@ def main():
         help="Rolling window for auto voice/music section classification (default: 400 ms)",
     )
     parser.add_argument(
-        "--voice-enter-percent", type=float, default=35.0,
+        "--voice-enter-percent", type=float, default=35.01,
         help="Enter voice sections when SILK/Hybrid win share reaches this percentage (default: 35)",
     )
     parser.add_argument(
@@ -2115,7 +2115,7 @@ def main():
 
     parser.add_argument(
         "--mode", choices=["auto", "music", "voice"],
-        default="AUTO",
+        default="auto",
         help=(
             "Coding mode: music forces CELT-only; voice forces SILK/Hybrid; "
             "auto (default) trial-encodes candidates and uses a rolling "
