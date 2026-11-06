@@ -1,5 +1,6 @@
 import argparse
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import copy
 import ctypes
 import math
 import os
@@ -16,7 +17,7 @@ RATE = 48000
 CHANNELS = 2
 OPUS_APPLICATION_AUDIO = 2049
 
-VBR_TRANSIENT_MULTIPLIER = 0.6
+VBR_TRANSIENT_MULTIPLIER = 3
 
 OPUS_SET_BITRATE_REQUEST = 4002
 OPUS_SET_MAX_BANDWIDTH_REQUEST = 4004
@@ -45,49 +46,22 @@ OPUS_BANDWIDTH_FULLBAND = 1105
 
 MIN_BITRATE_BPS = 500
 MAX_BITRATE_BPS = 512000
-# Any frame requested as Hybrid is raised to at least this bitrate, but only
-# when the overall encoder target is >= HYBRID_FLOOR_MIN_TARGET_KBPS.
-#
-# NOTE: libopus (measured on 1.4) silently turns a *CBR* Hybrid frame into
-# SILK-wideband when its bitrate request is below ~15 kbps. That does not
-# happen with libopus VBR enabled, so Hybrid frames are always encoded with
-# the encoder's VBR flag ON (see set_frame_vbr()). With VBR on, Hybrid is kept
-# at any requested bitrate; libopus itself then needs roughly 8.7 kbps (mono)
-# / 9.5-10 kbps (stereo) minimum for a real Hybrid frame.
 HYBRID_MIN_FRAME_BITRATE_BPS = 14000
-# libopus Hybrid with VBR misbehaves when asked for very low rates: requests
-# of about 1 kbps or less yield empty 1-byte packets, and SWB requests below
-# ~5 kbps (stereo) can produce maximum-size ~1276-byte packets (~510 kbps).
-# Hybrid requests are therefore never sent below this value. Real Hybrid
-# output is ~8.7 kbps or more regardless, so nothing is lost by the clamp.
 HYBRID_VBR_MIN_REQUEST_BPS = 6000
 HYBRID_FLOOR_MIN_TARGET_KBPS = 16.0
-# At or above this overall target, encode CELT-only: no Hybrid trials (auto
-# mode) and no forced Hybrid (voice mode).
 CELT_ONLY_MIN_TARGET_KBPS = 20.0
-# At or BELOW this overall target, auto and voice modes encode CELT-only too.
-# Not applied in --mode hybrid or --mode silk (explicit forced modes).
 CELT_ONLY_MAX_TARGET_KBPS = 10.0
 OGG_OVERHEAD_ESTIMATE_BPS = 250
-# Exact-ish Ogg container accounting used by the real-time (live) controller:
-# OpusHead page (27 + 1 + 19) + OpusTags page (27 + 1 + 24), one lacing byte
-# per 255 bytes of every packet (plus one), and a 27-byte header per page
-# (the writer starts a new page about every second).
 OGG_HEADER_BYTES = 99
 OGG_PAGE_HEADER_BYTES = 27
 MAX_PACKET_BYTES = 1275 * 3
 SWB_MONO_GUARD_KBPS = 12.0
-STEREO_MIN_BITRATE_BPS = 17000
-# libopus SILK silently drops to a lower bandwidth when the per-frame bitrate
-# request is too low (measured on 1.4): wideband needs >= 8 kbps, mediumband
-# >= 7 kbps; below ~7 kbps it falls to narrowband. In --mode silk every
-# frame is requested at no less than the value for the chosen bandwidth.
+STEREO_MIN_BITRATE_BPS = 20000
 SILK_HOLD_BANDWIDTH_MIN_BPS = {
     OPUS_BANDWIDTH_WIDEBAND: 8000,
     OPUS_BANDWIDTH_MEDIUMBAND: 7000,
     OPUS_BANDWIDTH_NARROWBAND: 0,
 }
-# Bandwidth names/configs for SILK-only packets (TOC config // 4).
 SILK_BANDWIDTH_NAMES = {
     OPUS_BANDWIDTH_NARROWBAND: "Narrowband",
     OPUS_BANDWIDTH_MEDIUMBAND: "Mediumband",
@@ -100,11 +74,6 @@ def vprint(args, *values, **kwargs):
 
 
 def auto_mono_enabled(args):
-    """Use a genuine mono stream at <=16 kbps, unless already requested.
-
-    --force-stereo disables the automatic <=16 kbps mono downmix and keeps a
-    genuine stereo stream (and stereo coding on every frame) at any bitrate.
-    """
     if args.force_stereo:
         return False
     return bool(args.pure_mono or args.bitrate <= 16.0)
@@ -211,7 +180,6 @@ def configure_opus_functions(opus):
     ]
     opus.opus_decode.restype = ctypes.c_int
 
-    # Variadic function: specify the return type, but not argtypes.
     opus.opus_encoder_ctl.restype = ctypes.c_int
 
     if hasattr(opus, "opus_get_version_string"):
@@ -257,8 +225,6 @@ def create_encoder(opus, args, cbr=True):
         raise RuntimeError(f"Could not create encoder: {error.value}")
 
     try:
-        # Hybrid must run with libopus VBR on or it falls back to SILK at
-        # low rates; every other mode keeps the custom-VBR CBR behaviour.
         opus_ctl(
             opus, encoder, OPUS_SET_VBR_REQUEST,
             1 if (args.mode == "hybrid" or not cbr) else 0,
@@ -266,7 +232,6 @@ def create_encoder(opus, args, cbr=True):
         opus_ctl(
             opus, encoder, OPUS_SET_COMPLEXITY_REQUEST, args.complexity
         )
-        # Voice signal hint for voice and hybrid modes; music otherwise.
         signal = (
             OPUS_SIGNAL_VOICE
             if args.mode in ("voice", "hybrid", "silk")
@@ -282,7 +247,6 @@ def create_encoder(opus, args, cbr=True):
                 opus, encoder, OPUS_SET_FORCE_CHANNELS_REQUEST, 2
             )
 
-        # Private/build-dependent control. Auto mode chooses a mode per frame.
         if args.mode == "music":
             opus_ctl(
                 opus, encoder,
@@ -290,15 +254,12 @@ def create_encoder(opus, args, cbr=True):
                 OPUS_MODE_CELT_ONLY,
             )
         elif args.mode == "hybrid":
-            # Force Hybrid from the very first frame so the encoder never
-            # starts in another mode.
             opus_ctl(
                 opus, encoder,
                 OPUS_SET_FORCE_MODE_REQUEST,
                 OPUS_MODE_HYBRID,
             )
         elif args.mode == "silk":
-            # Explicitly forced SILK-only (never chosen automatically).
             opus_ctl(
                 opus, encoder,
                 OPUS_SET_FORCE_MODE_REQUEST,
@@ -485,9 +446,7 @@ def find_ffmpeg():
 
 
 def _ffmpeg_pcm(path, channels, seek=None, length=None):
-    """Decode (a part of) the first audio stream to 48 kHz s16 PCM."""
     command = [find_ffmpeg(), "-hide_banner", "-loglevel", "error"]
-    # -ss / -t before -i are input options: fast, sample-accurate seeking.
     if seek is not None:
         command += ["-ss", str(seek)]
     if length is not None:
@@ -529,7 +488,6 @@ def _ffmpeg_pcm(path, channels, seek=None, length=None):
 
 
 def decode_input(path, pure_mono=False):
-    # FFmpeg downmixes to one channel before analysis/encoding when mono is on.
     channels = 1 if pure_mono else 2
     pcm = _ffmpeg_pcm(path, channels)
     if not pcm.size:
@@ -538,7 +496,6 @@ def decode_input(path, pure_mono=False):
 
 
 def probe_duration(path):
-    """Audio duration in seconds via ffprobe, or None if unavailable."""
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return None
@@ -557,8 +514,6 @@ def probe_duration(path):
     return None
 
 
-# Seams between parallel-decoded segments must match the overlap exactly
-# (lossless sources) or to within this many LSB (resampled/lossy decoders).
 DECODE_SEAM_TOLERANCE_LSB = 2
 DECODE_SEAM_PAD_SECONDS = 1
 DECODE_SEAM_PROBE_FRAMES = 8192
@@ -567,16 +522,6 @@ DECODE_SEAM_MAX_SHIFT = 16
 
 def decode_input_parallel(path, pure_mono=False, threads=2,
                           segment_seconds=60):
-    """Decode a long file as overlapping time segments in parallel.
-
-    Segment boundaries are whole seconds (so the resampler grid is the same
-    as in a single decode), and every segment is decoded with 1 s of extra
-    audio on each side. The overlap lets each seam be verified: the
-    neighbouring decodes must agree sample-for-sample (any 1-sample slip is
-    found and corrected, anything else is rejected). Returns None when the
-    parallel path can't be used or a seam does not verify; the caller then
-    does a normal single decode.
-    """
     channels = 1 if pure_mono else 2
     duration = probe_duration(path)
     segment = int(max(1, segment_seconds))
@@ -606,7 +551,6 @@ def decode_input_parallel(path, pure_mono=False, threads=2,
     window = DECODE_SEAM_PROBE_FRAMES
     for k in range(1, count):
         previous, current = decoded[k - 1], decoded[k]
-        # Search the overlap around this seam for the loudest probe window.
         seam = k * segment * RATE
         lo = max(origins[k] + DECODE_SEAM_MAX_SHIFT,
                  origins[k - 1]) + RATE // 10
@@ -642,7 +586,6 @@ def decode_input_parallel(path, pure_mono=False, threads=2,
                 best_shift, best_diff = shift, diff
         if best_diff is None or best_diff > DECODE_SEAM_TOLERANCE_LSB:
             return None
-        # A near-silent probe cannot tell shifts apart; prefer no shift.
         if best_energy < window * channels * 4 and best_diff == 0:
             best_shift = 0
         origins[k] += best_shift
@@ -687,7 +630,6 @@ def make_frames(pcm, frame_samples, channels):
 
 def normalize_analysis_frames(frames, args, channels):
     if not args.vbr_normalize or args.vbr_normalize_level == 0:
-        # Analysis frames are read-only, so no copy is needed.
         return [frame for frame, _ in frames]
 
     intensity = args.vbr_normalize_level / 10.0
@@ -872,23 +814,12 @@ def mode_multiplier(mode, args):
 
 
 def apply_hybrid_floor(requested, args):
-    """Raise a Hybrid frame's requested bitrate to HYBRID_MIN_FRAME_BITRATE_BPS
-    (14 kbps) when the overall encoder target is 16 kbps or higher.
-
-    Below a 16 kbps target the requested bitrate is returned unchanged;
-    Hybrid is still used there (libopus VBR keeps it from dropping to SILK).
-    """
     if args.bitrate >= HYBRID_FLOOR_MIN_TARGET_KBPS:
         return max(requested, HYBRID_MIN_FRAME_BITRATE_BPS)
     return requested
 
 
 def set_frame_vbr(opus, encoder, state, want_vbr):
-    """Switch libopus' VBR flag only when it changes.
-
-    Hybrid frames need VBR on (CBR Hybrid below ~15 kbps becomes SILK);
-    CELT/SILK frames keep the CBR + custom per-frame target behaviour.
-    """
     want = 1 if want_vbr else 0
     if state.get("vbr") != want:
         opus_ctl(opus, encoder, OPUS_SET_VBR_REQUEST, want)
@@ -896,13 +827,11 @@ def set_frame_vbr(opus, encoder, state, want_vbr):
 
 
 def celt_only_target(args):
-    """True when auto/voice modes use only CELT for the whole encode.
-
-    That is the case at or above CELT_ONLY_MIN_TARGET_KBPS (20) and at or
-    below CELT_ONLY_MAX_TARGET_KBPS (10). Never true in the explicit forced
-    modes --mode hybrid / --mode silk.
-    """
     if args.mode in ("hybrid", "silk"):
+        return False
+    # MODIFIED: honor --hybrid-trials always for --mode auto so Hybrid can
+    # compete with CELT at every bitrate the user requests.
+    if args.mode == "auto" and args.hybrid_trials == "always":
         return False
     return (
         args.bitrate >= CELT_ONLY_MIN_TARGET_KBPS
@@ -915,22 +844,18 @@ def celt_only_target(args):
 # ============================================================
 
 def _transient_score_for_signal(x):
-    """Score fast attacks in one frequency-isolated signal."""
     if len(x) < 3:
         return 0.0
 
     delta = np.diff(x, axis=0)
     mean_delta = float(np.mean(np.abs(delta)) + 1.0)
 
-    # Curvature catches sharp waveform edges and percussion attacks.
     second_delta = np.diff(x, n=2, axis=0)
     curvature = float(np.mean(np.abs(second_delta)) + 1.0)
     curvature_score = max(
         0.0, min(1.0, (curvature / max(mean_delta, 1.0) - 1.0) / 4.0)
     )
 
-    # Short sub-frame windows preserve brief attacks that a whole-frame
-    # average could otherwise hide.
     window_size = max(1, len(x) // 8)
     window_rms = []
     for start in range(0, len(x), window_size):
@@ -961,15 +886,10 @@ def _transient_score_for_signal(x):
         + 0.15 * peak_ratio_score
         + 0.15 * max(onset_score, peak_ratio_score)
     )
-    return max(0.0, min(1.0, score))
+    return max(0.0, min(2.0, score))
 
 
 def analyze_frame(frame, channels):
-    """Measure general activity and frequency-weighted transient energy.
-
-    Transient weighting: bass (<250 Hz) = 0.0, mids (250-4000 Hz) = 0.25,
-    treble (>4000 Hz) = 1.0. General activity remains broadband and unchanged.
-    """
     x = np.asarray(frame, dtype=np.float32).reshape(-1, channels)
 
     if len(x) < 3:
@@ -983,8 +903,6 @@ def analyze_frame(frame, channels):
     detail_activity = math.log10(1.0 + relative_delta * 20.0)
     activity = max(0.0, min(2.5, 0.20 * level_activity + 0.80 * detail_activity))
 
-    # Split the frame into frequency bands using an FFT. This affects only the
-    # transient detector; the regular broadband activity score is untouched.
     spectrum = np.fft.rfft(x, axis=0)
     frequencies = np.fft.rfftfreq(len(x), d=1.0 / RATE)
     bass_mask = frequencies < 250.0
@@ -1003,25 +921,11 @@ def analyze_frame(frame, channels):
     mid_transient = _transient_score_for_signal(mids)
     treble_transient = _transient_score_for_signal(treble)
 
-    # Bass has no direct transient contribution; mids contribute lightly,
-    # while treble attacks receive full weight. No normalization is applied,
-    # so mids alone cannot outweigh a similarly strong treble transient.
-    transient = (0.0 * bass_transient) + (0.15 * mid_transient) + (1.15 * treble_transient) * VBR+TRANSIENT_MULTIPLIER
+    transient = (0.25 * mid_transient + 1.0 * treble_transient) * VBR_TRANSIENT_MULTIPLIER
     return activity, max(0.0, min(1.0, transient))
 
 
-
-# ============================================================
-# Batched, parallel frame analysis for the custom VBR
-# ============================================================
-#
-# analyze_frame() above is the reference per-frame implementation. The
-# analysis depends only on the input audio (never on encoder state), so it is
-# computed ONCE for all frames, vectorized across frames, and spread over
-# worker processes. The encoder passes then just look the values up.
-
 def _transient_scores_batch(x):
-    """Vectorized _transient_score_for_signal for x of shape (F, n, ch)."""
     frames_count, n, _ = x.shape
     if n < 3:
         return np.zeros(frames_count)
@@ -1070,11 +974,8 @@ def _transient_scores_batch(x):
     return np.clip(score, 0.0, 1.0)
 
 
-def analyze_frames_batch(frames_2d, channels):
-    """Vectorized analyze_frame for int16 frames of shape (F, n * channels).
-
-    Returns (activity, transient) float arrays of length F.
-    """
+def analyze_frames_batch(frames_2d, channels, transient_multiplier=1.0,
+                          transient_curve=0.0):
     frames_count = frames_2d.shape[0]
     x = frames_2d.astype(np.float32).reshape(frames_count, -1, channels)
     n = x.shape[1]
@@ -1104,24 +1005,25 @@ def analyze_frames_batch(frames_2d, channels):
         spectrum * treble_mask[None, :, None], n=n, axis=1
     ).astype(np.float32, copy=False)
 
-    # Bass has weight 0.0, so it is not computed at all.
     transient = (
         0.25 * _transient_scores_batch(mids)
         + 1.0 * _transient_scores_batch(treble)
-    )
-    return activity, np.clip(transient, 0.0, 1.0)
+    ) * transient_multiplier
+    transient = np.clip(transient, 0.0, 1.0)
+    if transient_curve != 0:
+        transient = transient ** (5.0 ** (-transient_curve / 10.0))
+    return activity, transient
 
 
 def _metrics_block_worker(payload):
-    block, channels = payload
-    return analyze_frames_batch(block, channels)
+    block, channels, transient_multiplier, transient_curve = payload
+    return analyze_frames_batch(
+        block, channels, transient_multiplier, transient_curve
+    )
 
 
-def compute_frame_metrics(frames, channels, threads=1, block_frames=128):
-    """(activity, transient) per frame, batched and optionally multi-process.
-
-    frames: list of equal-length 1-D int16 arrays. Returns a list of tuples.
-    """
+def compute_frame_metrics(frames, channels, threads=1, block_frames=128,
+                          transient_multiplier=1.0, transient_curve=0.0):
     if not frames:
         return []
 
@@ -1137,12 +1039,18 @@ def compute_frame_metrics(frames, channels, threads=1, block_frames=128):
             ) as pool:
                 results = list(pool.map(
                     _metrics_block_worker,
-                    [(block, channels) for block in blocks],
+                    [(block, channels, transient_multiplier, transient_curve)
+                     for block in blocks],
                 ))
         except Exception:
             results = None
     if results is None:
-        results = [analyze_frames_batch(b, channels) for b in blocks]
+        results = [
+            analyze_frames_batch(
+                b, channels, transient_multiplier, transient_curve
+            )
+            for b in blocks
+        ]
 
     activity = np.concatenate([r[0] for r in results])
     transient = np.concatenate([r[1] for r in results])
@@ -1154,33 +1062,20 @@ def compute_frame_metrics(frames, channels, threads=1, block_frames=128):
 # ============================================================
 
 class BitrateController:
-    """Per-frame bitrate request.
-
-    realtime=False is the original ("uncalibrated") controller: a fixed
-    base rate shaped by activity and transients, with a weak, clamped
-    feedback term. It is used by two-pass pass 1 (whose shape is rescaled
-    afterwards) and by --pass-mode uncalibrated; it has no way to pull the
-    average back to the target on its own.
-
-    realtime=True is a closed-loop controller for --pass-mode live. After
-    every frame it knows exactly how many bytes the output file has used,
-    and sets the next frame's rate so that the file lands on the target
-    bitrate within `horizon_s` seconds:
-
-        rate = (budget(t + horizon) - bytes_so_far) / horizon
-
-    The activity/transient/mode "shape" is applied on top, normalized by its
-    own running average so that it redistributes bits between frames
-    without changing the average the feedback is holding.
-    """
-
     def __init__(self, target_kbps, intensity, channels,
                  low_rate_scaling=True, realtime=False, horizon_s=1.0,
-                 shape_tau_s=5.0, frame_ms=20.0):
+                 shape_tau_s=5.0, frame_ms=20.0, transient_decay_percent=65.0,
+                 transient_boost_cap=2.0):
         self.realtime = bool(realtime)
         self.horizon_s = max(0.05, float(horizon_s))
         self.shape_tau_s = max(0.05, float(shape_tau_s))
         self.frame_s = float(frame_ms) / 1000.0
+        self.transient_keep = 1.0 - max(
+            0.0, min(100.0, float(transient_decay_percent))
+        ) / 100.0
+        self.transient_boost_cap = max(0.0, float(transient_boost_cap))
+        self.boost_mean = None
+        self.prescale = 1.0
         self.lacing_bytes = 0
         self.shape_mean = None
         self.low_rate_scaling = bool(low_rate_scaling)
@@ -1190,7 +1085,6 @@ class BitrateController:
         self.channels = channels
         self.total_packet_bytes = 0
         self.total_samples = 0
-        # Tracks the carried-over transient decay envelope
         self.transient_envelope = 0.0
 
     def _realtime_bitrate(self, analysis_frames, index, multiplier):
@@ -1202,7 +1096,7 @@ class BitrateController:
 
         activity_factor = 1.0
         transient = 0.0
-        
+
         if self.intensity > 0:
             if isinstance(analysis_frames, list):
                 activity, transient = analysis_frames[index]
@@ -1210,20 +1104,21 @@ class BitrateController:
             else:
                 activity, transient = analysis_frames
                 next_transient = 0.0
-            
-            # Lookahead: combine current transient with 1/2 of the next frame's transient
+
             target_transient = max(transient, next_transient * 0.5)
-            # Carry-over: merge the lookahead target with 1/2 of the previous frame's decaying envelope
-            self.transient_envelope = max(target_transient, self.transient_envelope * 0.5)
-            
+            self.transient_envelope = max(
+            target_transient, self.transient_envelope * self.transient_keep
+        )
+
             activity_factor = 1.0 + strength * ((activity - 0.45) * 0.75)
             activity_factor = max(0.75, min(1.50, activity_factor))
 
-        # Split components mathematically
         non_transient = multiplier * activity_factor
-        transient_component = non_transient * (strength * 2.0 * self.transient_envelope)
-        
-        # Fixed lowering on non-transient components everywhere
+        transient_component = non_transient * min(
+            self.transient_boost_cap,
+            strength * 4.0 * self.transient_envelope,
+        )
+
         shape = (non_transient * 0.80) + transient_component
 
         if self.shape_mean is None:
@@ -1232,7 +1127,6 @@ class BitrateController:
         blend = min(1.0, self.frame_s / self.shape_tau_s)
         self.shape_mean += blend * (shape - self.shape_mean)
 
-        # Closed-loop level calculations
         elapsed = self.total_samples / RATE
         file_bytes = (
             OGG_HEADER_BYTES + self.total_packet_bytes + self.lacing_bytes
@@ -1275,15 +1169,25 @@ class BitrateController:
         )
         strength = (self.intensity / 2.857142857142857 / 3) * low_rate_scale
 
-        # Lookahead + Carry-over combined envelope logic
-        target_transient = max(transient, next_transient * 0.5)
-        self.transient_envelope = max(target_transient, self.transient_envelope * 0.5)
+        target_transient = max(transient, next_transient * 0.0)
+        self.transient_envelope = max(
+            target_transient, self.transient_envelope * self.transient_keep
+        )
 
         activity_factor = 1.0 + strength * ((activity - 0.45) * 0.75)
         activity_factor = max(0.75, min(1.50, activity_factor))
 
         non_transient = packet_target_bps * activity_factor
-        transient_component = non_transient * (strength * 2.0 * self.transient_envelope)
+        boost = min(
+            self.transient_boost_cap,
+            strength * 4.0 * self.transient_envelope,
+        )
+        if self.boost_mean is None:
+            self.boost_mean = boost
+        neutral = (0.80 + boost) / (0.80 + self.boost_mean)
+        self.boost_mean += min(1.0, self.frame_s / self.shape_tau_s) * (
+            boost - self.boost_mean
+        )
 
         if self.total_samples <= 0 or self.total_packet_bytes <= 0:
             feedback_factor = 1.0
@@ -1295,8 +1199,32 @@ class BitrateController:
             feedback_factor = ratio ** feedback_strength
             feedback_factor = max(0.85, min(1.20, feedback_factor))
 
-        requested = ((non_transient * 0.80) + transient_component) * feedback_factor
+        requested = (
+            non_transient * 0.80 * neutral * feedback_factor * self.prescale
+        )
         return int(max(MIN_BITRATE_BPS, min(MAX_BITRATE_BPS, requested)))
+
+    def calibrate_prescale(self, analysis_frames, multipliers):
+        if self.realtime or self.intensity == 0 or not multipliers:
+            return
+        probe = copy.copy(self)
+        probe.prescale = 1.0
+        probe.transient_envelope = 0.0
+        probe.boost_mean = None
+        probe.total_packet_bytes = 0
+        probe.total_samples = 0
+        probe.lacing_bytes = 0
+        total = 0.0
+        for i, multiplier in enumerate(multipliers):
+            total += probe.bitrate_for_frame(analysis_frames, i, multiplier)
+        mean_request = total / len(multipliers)
+        goal = max(
+            MIN_BITRATE_BPS,
+            self.target_bps * (sum(multipliers) / len(multipliers))
+            - OGG_OVERHEAD_ESTIMATE_BPS,
+        )
+        if mean_request > 0:
+            self.prescale = max(0.05, min(5.0, goal / mean_request))
 
     def record_packet(self, packet_bytes, frame_samples):
         self.lacing_bytes += int(packet_bytes) // 255 + 1
@@ -1304,14 +1232,11 @@ class BitrateController:
         self.total_samples += int(frame_samples)
 
 
-
-
 # ============================================================
 # Bandwidth selection
 # ============================================================
 
 def silk_bandwidth(args):
-    """Bandwidth for --mode silk (SILK maxes out at wideband)."""
     if args.bandwidth_mode == "narrowband":
         return OPUS_BANDWIDTH_NARROWBAND
     if args.bandwidth_mode == "mediumband":
@@ -1320,12 +1245,9 @@ def silk_bandwidth(args):
 
 
 def select_bandwidth(args, mode):
-    # SILK mode: fixed NB / MB / WB as requested (default wideband).
     if args.mode == "silk":
         return silk_bandwidth(args)
 
-    # Hybrid mode: libopus silently converts Hybrid to SILK-only whenever the
-    # bandwidth is wideband or lower, so only SWB or fullband may be requested.
     if args.mode == "hybrid":
         if args.bandwidth_mode == "fullband":
             return OPUS_BANDWIDTH_FULLBAND
@@ -1336,12 +1258,6 @@ def select_bandwidth(args, mode):
             if mode["swb"] else OPUS_BANDWIDTH_FULLBAND
         )
 
-    # Explicit override modes ignore the usual low-bitrate bandwidth policy.
-    # These are encoder requests; libopus may still internally limit the
-    # effective bandwidth when the requested bitrate is extremely low.
-    # Narrowband applies to CELT frames; a Hybrid frame (auto/voice between
-    # 10 and 20 kbps) still has to be SWB or fullband, see
-    # hybrid_frame_bandwidth().
     if args.bandwidth_mode == "narrowband":
         return OPUS_BANDWIDTH_NARROWBAND
     if args.bandwidth_mode == "wideband":
@@ -1356,11 +1272,9 @@ def select_bandwidth(args, mode):
             if mode["swb"] else OPUS_BANDWIDTH_FULLBAND
         )
 
-    # Default policy: at or below 6 kbps, request CELT wideband.
     if args.bitrate <= 6.0:
         return OPUS_BANDWIDTH_WIDEBAND
 
-    # Above 6 and below 10 kbps, default to SWB on every frame.
     if args.bitrate < 10.0:
         if not args.adaptive_swb:
             return OPUS_BANDWIDTH_SUPERWIDEBAND
@@ -1375,7 +1289,6 @@ def select_bandwidth(args, mode):
 
 
 def hybrid_frame_bandwidth(bandwidth):
-    """Hybrid needs SWB or fullband; WB or lower turns it into SILK."""
     return max(bandwidth, OPUS_BANDWIDTH_SUPERWIDEBAND)
 
 
@@ -1383,14 +1296,12 @@ def select_max_bandwidth(args):
     if args.mode == "silk":
         return silk_bandwidth(args)
 
-    # Hybrid mode: the ceiling must never be wideband or lower.
     if args.mode == "hybrid":
         return (
             OPUS_BANDWIDTH_SUPERWIDEBAND
             if args.bandwidth_mode == "swb" else OPUS_BANDWIDTH_FULLBAND
         )
 
-    # Explicit override modes also lift the script's normal low-rate ceiling.
     if args.bandwidth_mode == "narrowband":
         return OPUS_BANDWIDTH_NARROWBAND
     if args.bandwidth_mode in ("auto", "fullband"):
@@ -1412,11 +1323,6 @@ def select_max_bandwidth(args):
 # ============================================================
 
 def detect_speech_frame(frame, channels):
-    """Conservative heuristic detector; returns True for speech-like frames.
-
-    Uses periodicity, zero-crossing rate, and spectral flatness. This is not
-    a trained classifier; singing/rap and speech over music can be ambiguous.
-    """
     x = np.asarray(frame, dtype=np.float32)
     if channels == 2:
         x = x.reshape(-1, 2).mean(axis=1)
@@ -1430,15 +1336,11 @@ def detect_speech_frame(frame, channels):
     if peak < 80.0 or rms < 25.0:
         return False
 
-    # Speech commonly has moderate ZCR and some short-time periodicity.
     zcr = float(np.mean((x[1:] >= 0) != (x[:-1] >= 0)))
-    # Autocorrelation over plausible voiced speech pitch periods (roughly
-    # 70-400 Hz at 48 kHz). Normalize to avoid level dependence.
     max_lag = min(len(x) // 2, int(RATE / 70))
     min_lag = max(1, int(RATE / 400))
     if max_lag <= min_lag:
         return False
-    # Downsample for cheaper autocorrelation while preserving pitch range.
     y = x[::3]
     y = y * np.hanning(len(y))
     denom = float(np.dot(y, y)) + 1e-9
@@ -1447,15 +1349,12 @@ def detect_speech_frame(frame, channels):
     hi = min(len(corr) - 1, max_lag // 3)
     periodicity = float(np.max(corr[lo:hi+1]) / (corr[0] + 1e-9)) if hi >= lo else 0.0
 
-    # Spectral flatness: very noise-like frames are less likely to be voiced
-    # speech; this feature is deliberately weak because consonants are noisy.
     spec = np.abs(np.fft.rfft(x * np.hanning(len(x))))[1:] + 1e-8
     flatness = float(np.exp(np.mean(np.log(spec))) / (np.mean(spec) + 1e-9))
     return bool(periodicity >= 0.22 and zcr <= 0.32 and flatness <= 0.72)
 
 
 def detect_speech_sequence(frames, channels):
-    """Detect frames and smooth isolated decisions to reduce mode flapping."""
     raw = [detect_speech_frame(frame, channels) for frame, _ in frames]
     smoothed = []
     for i in range(len(raw)):
@@ -1470,7 +1369,6 @@ def detect_speech_sequence(frames, channels):
 # ============================================================
 
 def create_auto_candidates(opus, args, cbr=True):
-    """Create independent stateful encoder/decoder pairs for mode trials."""
     candidates = []
     for name, forced_mode, signal in (
         ("hybrid", OPUS_MODE_HYBRID, OPUS_SIGNAL_VOICE),
@@ -1513,7 +1411,6 @@ def create_auto_candidates(opus, args, cbr=True):
 
 
 def _multiresolution_spectrum(x, fft_size):
-    """Return overlapping Hann-window magnitude spectra for (samples, channels)."""
     n, channels = x.shape
     if n <= fft_size:
         starts = [0]
@@ -1536,13 +1433,6 @@ def _multiresolution_spectrum(x, fft_size):
 
 
 def candidate_distortion_reference(original, decoded, channels):
-    """Compare the actual decoded waveform plus its multi-resolution spectrum.
-
-    Lower is better. Unlike the earlier spectral-only scorer, this explicitly
-    measures sample-domain error and transient/slope error as well as spectral
-    shape and loudness-envelope changes. It is a heuristic, not a perceptual
-    MOS predictor.
-    """
     n_values = min(len(original), len(decoded))
     n_frames = n_values // channels
     if n_frames < 8:
@@ -1551,15 +1441,12 @@ def candidate_distortion_reference(original, decoded, channels):
     x = np.asarray(original[:n_values], dtype=np.float64).reshape(n_frames, channels)
     y = np.asarray(decoded[:n_values], dtype=np.float64).reshape(n_frames, channels)
 
-    # Remove DC consistently before comparing waveform and spectral content.
     x = x - np.mean(x, axis=0, keepdims=True)
     y = y - np.mean(y, axis=0, keepdims=True)
     reference_rms = float(np.sqrt(np.mean(x * x)) + 1.0)
 
-    # Direct waveform error, normalized so the score is not level-dependent.
     waveform = float(np.sqrt(np.mean((x - y) ** 2)) / reference_rms)
 
-    # First-difference error emphasizes transients and consonant edges.
     if n_frames > 1:
         dx = np.diff(x, axis=0)
         dy = np.diff(y, axis=0)
@@ -1581,7 +1468,6 @@ def candidate_distortion_reference(original, decoded, channels):
         for sx, sy in zip(x_specs, y_specs):
             lx = np.log1p(sx)
             ly = np.log1p(sy)
-            # Normalize log-spectrum error against the reference spectrum.
             scale = float(np.mean(np.abs(lx)) + 1.0)
             spectral_errors.append(float(np.mean(np.abs(lx - ly)) / scale))
             denom = float(np.linalg.norm(sx)) + 1e-9
@@ -1602,7 +1488,6 @@ def candidate_distortion_reference(original, decoded, channels):
         env_errors.append(float(np.mean(np.abs(np.log(rms_x / rms_y)))))
     envelope = float(np.mean(env_errors)) if env_errors else 0.0
 
-    # Clamp the secondary metrics so no one metric overwhelms the comparison.
     return (
         0.35 * min(waveform, 3.0)
         + 0.20 * min(transient, 3.0)
@@ -1612,19 +1497,7 @@ def candidate_distortion_reference(original, decoded, channels):
     )
 
 
-# ------------------------------------------------------------
-# Vectorized scoring with a per-frame cached reference
-# ------------------------------------------------------------
-# The original (un-coded) frame is the same for every candidate, so its
-# spectra are computed once per frame and shared. All windows of a spectrum
-# are transformed in one batched FFT instead of a Python loop.
-
 def _stft_mag(x, fft_size):
-    """Hann-windowed magnitude spectra of all overlapping windows.
-
-    Same window layout as _multiresolution_spectrum(); returns an array of
-    shape (windows, bins, channels).
-    """
     n, channels = x.shape
     if n < fft_size:
         padded = np.zeros((fft_size, channels), dtype=x.dtype)
@@ -1643,7 +1516,6 @@ def _stft_mag(x, fft_size):
 
 
 def prepare_distortion_reference(original, channels):
-    """Everything about the original frame that scoring reuses per candidate."""
     n_frames = len(original) // channels
     if n_frames < 8:
         return None
@@ -1686,7 +1558,6 @@ def prepare_distortion_reference(original, channels):
 
 
 def distortion_vs_reference(ref, decoded):
-    """Same metric as candidate_distortion_reference, using a cached reference."""
     channels = ref["channels"]
     n_frames = ref["n_frames"]
     y = np.asarray(
@@ -1734,7 +1605,6 @@ def distortion_vs_reference(ref, decoded):
 
 
 def candidate_distortion(original, decoded, channels):
-    """Drop-in replacement for candidate_distortion_reference()."""
     n_values = min(len(original), len(decoded))
     n_frames = n_values // channels
     if n_frames < 8:
@@ -1745,7 +1615,6 @@ def candidate_distortion(original, decoded, channels):
 
 
 def score_decoded(ref, original, decoded, channels):
-    """Score one candidate's decoded frame (cached reference when it fits)."""
     if ref is not None and len(decoded) == ref["n_frames"] * channels:
         return distortion_vs_reference(ref, decoded)
     return candidate_distortion(original[:len(decoded)], decoded, channels)
@@ -1755,34 +1624,28 @@ def score_decoded(ref, original, decoded, channels):
 # Candidate trials
 # ------------------------------------------------------------
 
-def candidate_eligible(name, bitrate, frame_is_mono):
-    # SILK is never an automatic candidate (only via --mode silk).
-    # Hybrid is eligible at every bitrate (it runs with VBR on so libopus
-    # does not fall back to SILK). Above 16 kbps, retain the existing
-    # mono/near-mono restriction. CELT remains the fallback.
-    if bitrate > 16000 and name == "hybrid" and not frame_is_mono:
+def candidate_eligible(name, bitrate, frame_is_mono, args):
+    # MODIFIED: honor --hybrid-trials; default "auto" preserves legacy
+    # mono-only-above-16k behavior.
+    if name != "hybrid":
+        return True
+    if args.hybrid_trials == "always":
+        return True
+    if args.hybrid_trials == "never":
         return False
-    return True
+    # "auto": legacy behavior — Hybrid only at <=16 kbps or on mono frames.
+    return bitrate <= 16000 or frame_is_mono
 
 
 def run_candidate_frame(opus, candidate, frame, frame_samples, channels,
                         bitrate, bandwidth, max_bandwidth, frame_is_mono,
                         args):
-    """Trial-encode and decode ONE frame with one candidate.
-
-    Returns the decoded int16 samples, or None if this mode/bandwidth
-    combination is unsupported by the libopus build. Only the candidate's
-    own encoder/decoder state is touched, so different candidates can run
-    in different threads (the ctypes calls release the GIL).
-    """
     pcm_ptr = frame.ctypes.data_as(ctypes.POINTER(ctypes.c_int16))
     outbuf = (ctypes.c_ubyte * MAX_PACKET_BYTES)()
     decoded_buf = (ctypes.c_int16 * (frame_samples * channels))()
     enc = candidate["encoder"]
     dec = candidate["decoder"]
     try:
-        # Trial Hybrid at the same floored rate it would actually be
-        # encoded at, so the mode competition is fair.
         trial_bitrate = bitrate
         if candidate["name"] == "hybrid":
             trial_bitrate = max(
@@ -1799,7 +1662,7 @@ def run_candidate_frame(opus, candidate, frame, frame_samples, channels,
             cmax = hybrid_frame_bandwidth(
                 min(cmax, OPUS_BANDWIDTH_SUPERWIDEBAND)
             )
-            opus_ctl(opus, enc, OPUS_SET_VBR_REQUEST, 1)
+            opus_ctl(opus, enc, OPUS_SET_VBR_REQUEST, 0)
         opus_ctl(opus, enc, OPUS_SET_BANDWIDTH_REQUEST, cbw)
         opus_ctl(opus, enc, OPUS_SET_MAX_BANDWIDTH_REQUEST, cmax)
         opus_ctl(opus, enc, OPUS_SET_BITRATE_REQUEST, trial_bitrate)
@@ -1822,12 +1685,10 @@ def run_candidate_frame(opus, candidate, frame, frame_samples, channels,
         return np.ctypeslib.as_array(decoded_buf)[
             :decoded_count * channels].copy()
     except Exception:
-        # A mode/bandwidth combination may be unsupported by this build.
         return None
 
 
 def pick_winner(scores):
-    """Lowest-distortion candidate. scores: {name: score} in candidate order."""
     modes = {"hybrid": OPUS_MODE_HYBRID, "celt": OPUS_MODE_CELT_ONLY}
     valid = [
         (score, name) for name, score in scores.items() if score is not None
@@ -1841,11 +1702,10 @@ def pick_winner(scores):
 def choose_candidate_mode(opus, candidates, frame, frame_samples, channels,
                           bitrate, bandwidth, max_bandwidth, frame_is_mono,
                           original_samples, args, executor=None):
-    """Per-frame trial used when per-frame bitrates are not known ahead of
-    time (single-pass 'live' mode). Candidates run concurrently in threads."""
+    # MODIFIED: pass args into candidate_eligible()
     eligible = [
         c for c in candidates
-        if candidate_eligible(c["name"], bitrate, frame_is_mono)
+        if candidate_eligible(c["name"], bitrate, frame_is_mono, args)
     ]
 
     def run(candidate):
@@ -1872,7 +1732,6 @@ def choose_candidate_mode(opus, candidates, frame, frame_samples, channels,
 
 
 def _score_frame_task(payload):
-    """Worker: score every candidate's decoded frame against the original."""
     original, decoded_by_name, channels = payload
     if not decoded_by_name:
         return {}
@@ -1885,18 +1744,6 @@ def _score_frame_task(payload):
 
 def compute_trial_scores(opus, args, frames, plan, frame_samples, cbr,
                          threads, block_frames=256):
-    """Mode-trial scores for EVERY frame, computed in parallel.
-
-    The candidate encoders never depend on the output encoder or on the mode
-    decisions: each one just encodes and decodes the frames it is eligible
-    for, one after another. So each candidate's whole chain runs in its own
-    thread (block by block, to bound memory), and the expensive distortion
-    scoring of each block is spread over worker processes. The result is
-    the same as the per-frame trial, only computed ahead of time.
-
-    plan[i] = (requested_bitrate, bandwidth, max_bandwidth, frame_is_mono).
-    Returns a list of {name: score} dicts, one per frame.
-    """
     channels = output_channels(args)
     candidates = create_auto_candidates(opus, args, cbr=cbr)
     total = len(frames)
@@ -1917,7 +1764,8 @@ def compute_trial_scores(opus, args, frames, plan, frame_samples, cbr,
         out = {}
         for i in range(first, last):
             requested, bandwidth, max_bandwidth, mono = plan[i]
-            if not candidate_eligible(candidate["name"], requested, mono):
+            # MODIFIED: pass args into candidate_eligible()
+            if not candidate_eligible(candidate["name"], requested, mono, args):
                 continue
             decoded = run_candidate_frame(
                 opus, candidate, frames[i][0], frame_samples, channels,
@@ -1967,15 +1815,12 @@ def compute_trial_scores(opus, args, frames, plan, frame_samples, cbr,
 
 
 def frame_is_silent(frame, threshold):
-    """True silence test used for the active-frame bitrate floor."""
     frame_peak = float(np.max(np.abs(frame))) if frame.size else 0.0
     frame_rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2))) if frame.size else 0.0
     return frame_peak < threshold or frame_rms < threshold
 
 
 def mark_silent_frames(frames, modes, threshold, block_frames=256):
-    """Evaluate the silence test once per frame (batched) instead of in
-    every encoder pass and every trial plan."""
     for first in range(0, len(frames), block_frames):
         block = np.stack([f for f, _ in frames[first:first + block_frames]])
         peak = np.max(np.abs(block), axis=1).astype(np.float64)
@@ -1988,15 +1833,6 @@ def mark_silent_frames(frames, modes, threshold, block_frames=256):
 
 
 def frame_floor_fraction(args, mode):
-    """Minimum per-frame request, as a fraction of the target bitrate.
-
-    Normal (active) frames are held at --active-floor so the rate cannot
-    sag during ordinary material. Only very quiet frames may drop lower:
-    the floor slides smoothly from --active-floor (frame level at or above
-    --active-db) down to --inactive-floor (at or below --inactive-db).
-    SWB + mono frames keep their reduced floor (2/3 of the active floor,
-    i.e. 1/3 of the target at the default 0.5).
-    """
     active = args.active_floor
     if mode.get("swb") and mode.get("mono"):
         active *= 2.0 / 3.0
@@ -2012,50 +1848,45 @@ def frame_floor_fraction(args, mode):
 
 
 def plan_frame_request(args, channels, frame, mode, requested):
-    """Clamp and floor one frame's requested bitrate; decide mono coding.
-
-    Shared by the encode loop and by the ahead-of-time trial planning so
-    both see exactly the same per-frame bitrate and channel decision.
-    Returns (requested, frame_is_mono).
-    """
     phase_inverted = mode.get("phase_inverted", False)
+
     requested = int(max(
         MIN_BITRATE_BPS,
         min(MAX_BITRATE_BPS, requested),
     ))
 
-    # Active-frame bitrate floor: avoid extreme one-frame target dips.
-    # This floors the bitrate REQUEST sent to libopus, not the actual
-    # packet size (libopus VBR may still emit a smaller packet).
-    # True silence is exempt so quiet gaps can remain efficiently coded.
-    # The silence decision is made once per frame by mark_silent_frames().
     is_silence_frame = mode.get("silent")
     if is_silence_frame is None:
-        is_silence_frame = frame_is_silent(frame, args.silence_threshold)
-        
-    if not is_silence_frame:
-        requested = max(
-            requested,
-            int(args.bitrate * 1000.0 * frame_floor_fraction(args, mode)),
+        is_silence_frame = frame_is_silent(
+            frame, args.silence_threshold
         )
 
-    # Preserve the requested phase-inverted stereo floor.
-    if phase_inverted and channels == 2:
-        requested = max(
-            requested,
-            int(args.phase_invert_floor_kbps * 1000),
-        )
-
-    # At <=16 kbps, automatically use mono coding for ordinary
-    # content to concentrate the limited bits. Above 16 kbps, use
-    # the mono/mostly-mono detector. Phase-inverted material stays
-    # stereo so its side-channel information is not collapsed.
     frame_is_mono = (
         channels == 2
         and not phase_inverted
         and not args.force_stereo
         and (args.bitrate <= 16.0 or mode["mono"])
     )
+
+    if not is_silence_frame:
+        requested = max(
+            requested,
+            int(args.bitrate * 1000.0 * frame_floor_fraction(args, mode)),
+        )
+
+        # Dedicated minimum bitrate for stereo frames
+        if channels == 2 and not frame_is_mono:
+            requested = max(
+                requested,
+                STEREO_MIN_BITRATE_BPS,
+            )
+
+    if phase_inverted and channels == 2:
+        requested = max(
+            requested,
+            int(args.phase_invert_floor_kbps * 1000),
+        )
+
     return requested, frame_is_mono
 
 
@@ -2074,17 +1905,19 @@ def encode_packets(
         horizon_s=args.live_horizon_seconds,
         shape_tau_s=args.live_shape_seconds,
         frame_ms=args.frame_ms,
+        transient_decay_percent=args.transient_decay_percent,
+        transient_boost_cap=args.transient_boost_cap,
     )
+    if targets is None:
+        controller.calibrate_prescale(
+            analysis_frames,
+            [mode_multiplier(m, args) for m in modes],
+        )
 
     packets = []
     rates = []
     output_buffer = (ctypes.c_ubyte * MAX_PACKET_BYTES)()
     celt_only = celt_only_target(args)
-    # Mode trials. When the per-frame bitrates are known ahead of time
-    # (two-pass) they are computed for all frames up front, in parallel, by
-    # compute_trial_scores(). Only single-pass live mode, whose bitrates
-    # depend on the output encoder's own feedback, still trials frame by
-    # frame, with the candidates running concurrently.
     trials_needed = (
         args.mode == "auto" and auto_mode_select and not celt_only
         and not (auto_mode_choices is not None
@@ -2114,17 +1947,12 @@ def encode_packets(
         else None
     )
     auto_wins = Counter()
-    # Tracks libopus' VBR flag so it is only changed when needed.
     vbr_state = {"vbr": 1 if (args.mode == "hybrid" or not cbr) else 0}
-    # In hybrid mode the encoder was already forced to Hybrid at creation.
     last_forced_mode = {
         "hybrid": OPUS_MODE_HYBRID, "silk": OPUS_MODE_SILK_ONLY,
     }.get(args.mode)
-    # Count packets that came out as something other than Hybrid (hybrid mode).
     non_hybrid = 0
     non_hybrid_frames = []
-    # Section-level voice/music classifier driven by the candidate scorer.
-    # The rolling window contains each frame's raw lowest-distortion winner.
     section_win_history = deque(maxlen=max(
         1, int(round(args.section_window_ms / args.frame_ms))
     ))
@@ -2150,7 +1978,6 @@ def encode_packets(
                 select_max_bandwidth(args),
             )
 
-            # Change the call signature to pass 'analysis_frames' and the index 'i'
             if targets is None:
                 requested = controller.bitrate_for_frame(
                     analysis_frames,
@@ -2165,10 +1992,7 @@ def encode_packets(
 
             if args.mode == "auto":
                 if auto_mode_select:
-                    # Candidate competition is enabled only for the final
-                    # encode. Calibration passes leave Opus in automatic mode.
                     if celt_only:
-                        # Target >= 20 or <= 10 kbps: CELT-only, no mode trials.
                         chosen_mode = OPUS_MODE_CELT_ONLY
                         trial_scores = {}
                     elif auto_mode_choices is not None and i < len(auto_mode_choices):
@@ -2209,9 +2033,12 @@ def encode_packets(
                                 f"({voice_ratio * 100:.1f}% Hybrid wins)",
                             )
 
-                        if voice_section:
-                            # In a voice-classified section, choose the best
-                            # eligible Hybrid candidate by waveform score.
+                        # MODIFIED: with --hybrid-trials always, the section
+                        # classifier does NOT override the raw winner. The
+                        # per-frame trial result is used as-is.
+                        if args.hybrid_trials == "always":
+                            chosen_mode = raw_winner
+                        elif voice_section:
                             voice_scores = [
                                 (score, name) for name, score in trial_scores.items()
                                 if name == "hybrid" and math.isfinite(score)
@@ -2222,19 +2049,13 @@ def encode_packets(
                             else:
                                 chosen_mode = raw_winner
                         else:
-                            # Music sections deliberately use CELT-only mode.
                             chosen_mode = OPUS_MODE_CELT_ONLY
                         if auto_mode_choices is not None:
                             auto_mode_choices.append(chosen_mode)
 
-                    # Safety guard: SILK is never selected automatically.
                     if chosen_mode == OPUS_MODE_SILK_ONLY:
                         chosen_mode = OPUS_MODE_CELT_ONLY
 
-                    # Change the private force-mode control only when the selected
-                    # mode actually changes. Reissuing this private control on every
-                    # frame can disturb encoder state in some libopus builds and may
-                    # create an audible dip at CELT/Hybrid boundaries.
                     if chosen_mode != last_forced_mode:
                         opus_ctl(opus, encoder, OPUS_SET_FORCE_MODE_REQUEST, chosen_mode)
                         last_forced_mode = chosen_mode
@@ -2244,26 +2065,17 @@ def encode_packets(
                     }.get(chosen_mode, "unknown")
                     auto_wins[chosen_name] += 1
                 else:
-                    # Calibration-only pass: don't run the candidate scorer or
-                    # force a mode. Let libopus choose normally for rate tuning.
                     pass
             elif args.mode == "voice":
-                # No SILK. CELT-only at targets <=10 or >=20 kbps; in between,
-                # CELT for wideband or Hybrid for SWB/fullband.
                 if celt_only:
                     forced_mode = OPUS_MODE_CELT_ONLY
                 elif bandwidth == OPUS_BANDWIDTH_WIDEBAND:
                     forced_mode = OPUS_MODE_CELT_ONLY
                 else:
                     forced_mode = OPUS_MODE_HYBRID
-                    # Forced-Hybrid frames get the 14 kbps floor when the
-                    # overall target is >= 16 kbps.
                     requested = apply_hybrid_floor(requested, args)
                 opus_ctl(opus, encoder, OPUS_SET_FORCE_MODE_REQUEST, forced_mode)
             elif args.mode == "silk":
-                # Explicit SILK-only at the NB/MB/WB bandwidth requested.
-                # Keep the request high enough that libopus does not lower
-                # the SILK bandwidth by itself.
                 requested = max(
                     requested,
                     SILK_HOLD_BANDWIDTH_MIN_BPS[silk_bandwidth(args)],
@@ -2275,9 +2087,6 @@ def encode_packets(
                     )
                     last_forced_mode = OPUS_MODE_SILK_ONLY
             elif args.mode == "hybrid":
-                # Always Hybrid: no SILK, no CELT, at every bitrate. The
-                # bandwidth selected above is guaranteed SWB or fullband and
-                # libopus VBR is on, so low rates cannot drop to SILK.
                 requested = apply_hybrid_floor(requested, args)
                 if last_forced_mode != OPUS_MODE_HYBRID:
                     opus_ctl(
@@ -2286,11 +2095,6 @@ def encode_packets(
                     )
                     last_forced_mode = OPUS_MODE_HYBRID
 
-            # If Hybrid wins the final-iteration mode competition, raise the
-            # frame's encoder target to the Hybrid floor (14 kbps) when the
-            # overall target is >= 16 kbps. Opus bitrate control is
-            # encoder-wide and VBR packet sizes can still vary, so this is
-            # a per-frame target request, not a packet-size guarantee.
             if (
                 args.mode == "auto"
                 and auto_mode_select
@@ -2298,10 +2102,6 @@ def encode_packets(
             ):
                 requested = apply_hybrid_floor(requested, args)
 
-            # libopus codes the first frame after a SILK/Hybrid -> CELT switch
-            # in the PREVIOUS mode (it carries a redundant CELT transition
-            # frame). Keep that transition frame Hybrid (VBR on) rather than
-            # letting it come out as SILK.
             frame_is_hybrid = (
                 args.mode == "hybrid"
                 or (args.mode == "voice" and forced_mode == OPUS_MODE_HYBRID)
@@ -2319,13 +2119,10 @@ def encode_packets(
                 if current_mode == OPUS_MODE_CELT_ONLY:
                     previous_kind = classify_opus_packet(packets[-1])["mode"]
                     if previous_kind == "Hybrid":
-                        # Transition frame is coded as Hybrid: VBR must be on.
                         frame_is_hybrid = True
 
             if frame_is_hybrid:
                 requested = max(requested, HYBRID_VBR_MIN_REQUEST_BPS)
-                # Hybrid needs SWB/fullband and libopus VBR on, otherwise
-                # libopus silently converts it to SILK-wideband.
                 hybrid_bw = hybrid_frame_bandwidth(bandwidth)
                 if hybrid_bw != bandwidth:
                     opus_ctl(
@@ -2339,8 +2136,6 @@ def encode_packets(
                 set_frame_vbr(opus, encoder, vbr_state,
                               frame_is_hybrid or not cbr)
 
-            # Stereo floor is intentionally disabled in this settings variant.
-            # STEREO_MIN_BITRATE_BPS remains available if the floor is re-enabled.
             requested = min(MAX_BITRATE_BPS, requested)
 
             opus_ctl(
@@ -2350,9 +2145,6 @@ def encode_packets(
             )
 
             if channels == 2:
-                # Allow mono coding only when the detector identifies a
-                # mono/mostly-mono frame. Phase-inverted material is kept
-                # stereo to avoid destructive cancellation.
                 opus_ctl(
                     opus, encoder,
                     OPUS_SET_FORCE_CHANNELS_REQUEST,
@@ -2380,8 +2172,6 @@ def encode_packets(
             packets.append(packet)
             rates.append(packet_length * 8.0 / (frame_samples / RATE))
 
-            # Verify that libopus really produced the forced mode (and, for
-            # SILK, the requested NB/MB/WB bandwidth).
             if args.mode in ("hybrid", "silk"):
                 info = classify_opus_packet(packet)
                 wanted = "Hybrid" if args.mode == "hybrid" else "SILK"
@@ -2614,13 +2404,6 @@ def measure_file(path, duration):
     return size, rate
 
 
-# Calibration passes only need to MEASURE the bitrate of a given set of
-# per-frame targets, so they can be split into time chunks that encode
-# concurrently in worker processes. Each chunk first encodes a short
-# pre-roll (the frames just before it) to warm up the codec state, and
-# those pre-roll packets are discarded. The result is an estimate that is
-# within a few hundredths of a kbps of the sequential pass; the final
-# encode that is actually kept is always one sequential, exact pass.
 CHUNK_PREROLL_MS = 500.0
 MIN_CHUNK_FRAMES = 300
 
@@ -2643,7 +2426,6 @@ def _encode_chunk_worker(payload):
 
 def encode_packets_chunked(pool, args, frames, modes, analysis_frames,
                            frame_samples, targets, cbr=True):
-    """Parallel calibration encode. Returns None if it cannot be used."""
     total = len(frames)
     chunks = min(args.threads, total // MIN_CHUNK_FRAMES)
     if pool is None or chunks < 2:
@@ -2684,11 +2466,7 @@ def run_two_pass(
 
     vprint(args, "\nPASS 1: OpusPlus custom-VBR analysis (libopus CBR)")
 
-    # Pass 1 is bitrate calibration only. Candidate mode competition is
-    # deliberately deferred until the final encode.
     auto_mode_choices = None
-    # Keep libopus internal VBR disabled at every bitrate. OpusPlus performs
-    # custom frame-by-frame VBR by changing the CBR target for each frame.
     pass1_cbr = True
     packets, pass1_rates, _, _ = encode_packets(
         opus, args, frames, modes, analysis_frames, frame_samples,
@@ -2738,11 +2516,6 @@ def run_two_pass(
         "calibrating custom-VBR targets with libopus CBR",
     )
 
-    # Chunked calibration is exact only when the calibration pass is CBR
-    # (auto, music, silk): measured identical to the sequential pass. In
-    # voice/hybrid mode the calibration pass runs libopus VBR, whose
-    # internal state takes much longer than a pre-roll to settle (chunked
-    # estimates came out 0.2-0.5 kbps low), so those stay sequential.
     chunk_pool = None
     if (
         args.threads > 1
@@ -2815,17 +2588,8 @@ def run_two_pass(
             )
             multiplier = max(0.05, min(20.0, multiplier))
 
-        # Final encode(s): per-frame waveform-based mode competition runs here
-        # and nowhere in the calibration passes. Because the selected modes
-        # (Hybrid especially) cost more or less than the calibration passes
-        # predicted, the final encode is itself calibrated: the mode choices
-        # from the first final encode are cached and reused, and only the
-        # per-frame targets are rescaled until the file lands on the target.
-        # The output always comes from a selected-mode encode.
         final_choices = [] if args.mode == "auto" else None
         final_best = None
-        # Never overshoot: aim half a tolerance below the target and accept
-        # only results in [target - tolerance, target].
         tolerance_bps = args.pass_tolerance_kbps * 1000.0
         aim_file_bps = max(
             MIN_BITRATE_BPS, target_file_bps - tolerance_bps * 0.5
@@ -2856,7 +2620,6 @@ def run_two_pass(
                 f"error={final_error_bps / 1000:+.3f} kbps",
             )
 
-            # Rank non-overshooting results first, then by closeness.
             rank = (final_error_bps < 0, abs(final_error_bps))
             if final_best is None or rank < final_best[0]:
                 final_best = (
@@ -2981,7 +2744,6 @@ def encode(args):
     args.codec_strategy = resolve_codec_strategy(args)
 
     if args.codec_strategy == "celt" and args.pure_mono:
-        # CELT supports mono, so this is allowed.
         pass
 
     if not 0 <= args.complexity <= 10:
@@ -2990,8 +2752,23 @@ def encode(args):
     if not 0 <= args.vbr_intensity <= 20:
         raise ValueError("VBR intensity must be between 0 and 20")
 
+    if args.transient_multiplier < 0:
+        raise ValueError("Transient multiplier cannot be negative")
+
+    if not 0.0 <= args.transient_decay_percent <= 100.0:
+        raise ValueError("Transient decay must be between 0 and 100 percent")
+
+    if args.transient_boost_cap < 0:
+        raise ValueError("Transient boost cap cannot be negative")
+
+    if not -10.0 <= args.transient_curve <= 10.0:
+        raise ValueError("Transient curve must be between -10 and 10")
+
     if not 1 <= args.pass_iterations <= 10:
         raise ValueError("Pass iterations must be between 1 and 10")
+
+    if args.pass_tolerance_kbps is None:
+        args.pass_tolerance_kbps = args.bitrate * 0.01
 
     if args.pass_tolerance_kbps < 0:
         raise ValueError("Pass tolerance cannot be negative")
@@ -3101,7 +2878,8 @@ def encode(args):
                 "voice": "HYBRID/CELT (voice, no SILK)",
                 "silk": "SILK-ONLY (forced; "
                         + SILK_BANDWIDTH_NAMES[silk_bandwidth(args)].upper() + ")",
-                "auto": "THREE-CANDIDATE MODE TRIALS",
+                "auto": "HYBRID vs CELT MODE TRIALS"
+                        + (" (Hybrid on every frame)" if args.hybrid_trials == "always" else ""),
                 "music": "CELT-ONLY (music)",
                 "hybrid": "HYBRID-ONLY (forced; SWB/fullband only)",
             }[args.mode]
@@ -3111,6 +2889,8 @@ def encode(args):
     vprint(args, "Mode forcing:            uses private libopus force-mode request; build-dependent")
     vprint(args, "SILK:                   never automatic (use --mode silk)")
     vprint(args, f"Stereo:                 {'forced' if args.force_stereo else 'auto (mono at <=16 kbps)'}")
+    if args.mode == "auto":
+        vprint(args, f"Hybrid trials:          {args.hybrid_trials}")
     if args.bitrate >= HYBRID_FLOOR_MIN_TARGET_KBPS:
         vprint(
             args,
@@ -3233,13 +3013,13 @@ def encode(args):
     total_samples = len(pcm) // channels
     frames = make_frames(pcm, frame_samples, channels)
     analysis_frames = normalize_analysis_frames(frames, args, channels)
-    # VBR frame analysis depends only on the audio, so it is computed once
-    # (batched, multi-process) instead of inside every encoder pass.
     if args.vbr_intensity == 0:
         analysis_frames = [(0.45, 0.0)] * len(analysis_frames)
     else:
         analysis_frames = compute_frame_metrics(
-            analysis_frames, channels, threads=args.threads
+            analysis_frames, channels, threads=args.threads,
+            transient_multiplier=args.transient_multiplier,
+            transient_curve=args.transient_curve,
         )
     modes = analyze_all_modes(frames, args)
     mark_silent_frames(frames, modes, args.silence_threshold)
@@ -3398,9 +3178,13 @@ def main():
         "--pass-adjust", choices=["add", "multiply"],
         default="multiply",
     )
-    parser.add_argument("--pass-iterations", type=int, default=4)
+    parser.add_argument("--pass-iterations", type=int, default=8)
     parser.add_argument(
-        "--pass-tolerance-kbps", type=float, default=0.5
+        "--pass-tolerance-kbps", type=float, default=None,
+        help=(
+            "Accepted two-pass bitrate error in kbps (default: 1%% of the "
+            "target bitrate, e.g. 0.32 at 32 kbps, 4 at 400 kbps)"
+        ),
     )
 
     parser.add_argument(
@@ -3411,15 +3195,15 @@ def main():
         help="SWB bitrate multiplier; default 0.75x",
     )
 
-    parser.add_argument("--mono-enter-db", type=float, default=-51.0)
-    parser.add_argument("--mono-exit-db", type=float, default=-51.0)
+    parser.add_argument("--mono-enter-db", type=float, default=-70.0)
+    parser.add_argument("--mono-exit-db", type=float, default=-70.0)
 
     parser.add_argument(
-        "--swb-enter-db", type=float, default=-45.0,
+        "--swb-enter-db", type=float, default=-55.0,
         help="Enter SWB detection below this high/low energy ratio",
     )
     parser.add_argument(
-        "--swb-exit-db", type=float, default=-45.0,
+        "--swb-exit-db", type=float, default=-55.0,
         help="Remain in SWB while below this high/low energy ratio",
     )
 
@@ -3482,6 +3266,37 @@ def main():
         choices=range(21), default=10,
     )
     parser.add_argument(
+        "--transient-multiplier", type=float, default=VBR_TRANSIENT_MULTIPLIER,
+        help=(
+            "Transient detector sensitivity: gain applied to the transient "
+            "score before it is clipped to 0-1 (default 3; 1 = unscaled)"
+        ),
+    )
+    parser.add_argument(
+        "--transient-curve", type=float, default=-5,
+        help=(
+            "Transient response curve, -10 to 10 (default -5; 0 = linear). "
+            "Positive: even small transients get a big boost. Negative: "
+            "only strong transients get much boost (-10 = barely any)"
+        ),
+    )
+    parser.add_argument(
+        "--transient-decay-percent", type=float, default=65.0,
+        help=(
+            "Percent of the transient bitrate boost lost each frame "
+            "(0-100, default 65). Higher = shorter tail; 100 = no "
+            "carry-over; 0 = never decays"
+        ),
+    )
+    parser.add_argument(
+        "--transient-boost-cap", type=float, default=3,
+        help=(
+            "Maximum transient boost as a multiple of the base rate "
+            "(default 3.0 -> a transient frame asks for about 3x the "
+            "base rate). Lower = calmer bitrate; large = uncapped"
+        ),
+    )
+    parser.add_argument(
         "--no-low-rate-scaling", action="store_true",
         help=(
             "Disable the proportional reduction of VBR strength below "
@@ -3504,11 +3319,11 @@ def main():
         help="Rolling window for auto voice/music section classification (default: 400 ms)",
     )
     parser.add_argument(
-        "--voice-enter-percent", type=float, default=40.01,
+        "--voice-enter-percent", type=float, default=70.01,
         help="Enter voice sections when Hybrid win share reaches this percentage (default: 40)",
     )
     parser.add_argument(
-        "--voice-exit-percent", type=float, default=40.0,
+        "--voice-exit-percent", type=float, default=70.0,
         help="Return to music sections when Hybrid win share falls to this percentage (default: 40)",
     )
 
@@ -3523,9 +3338,26 @@ def main():
             "SILK; see --bandwidth-mode narrowband/mediumband/wideband, "
             "requires --frame-ms >= 10); auto trial-encodes Hybrid vs CELT "
             "and uses a rolling Hybrid win-rate to classify voice-like "
-            "sections versus music sections (CELT-only at <=10 or >=20 kbps)"
+            "sections versus music sections (CELT-only at <=10 or >=20 kbps "
+            "unless --hybrid-trials always)"
         ),
     )
+
+    # MODIFIED: new flag to control Hybrid participation in --mode auto trials.
+    parser.add_argument(
+        "--hybrid-trials",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help=(
+            "When --mode auto considers Hybrid in its per-frame trials: "
+            "'auto' = legacy behavior (Hybrid only on mono/mostly-mono "
+            "frames above 16 kbps, and only in voice sections); 'always' = "
+            "Hybrid competes with CELT on every frame at every bitrate "
+            "(disables the >=20/<=10 kbps CELT-only shortcut and the "
+            "music-section CELT-only override); 'never' = CELT only"
+        ),
+    )
+
     parser.add_argument(
         "--codec-strategy",
         choices=["auto", "swb", "celt"],
